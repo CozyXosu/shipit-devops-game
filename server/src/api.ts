@@ -14,6 +14,7 @@ import { getFile, writeFile, resolvePath, getNode, listDir, nodeSizeMB } from '.
 import { currentMission, currentPackMission, evalRequirements, evaluateMissions, takeHint, fillTemplate, commandsRun, allMissionSummaries } from './engine';
 import { availablePacks, activatePack, currentPackMissionOf, getPack, packMissionsOf } from './missions/packs';
 import { solveMission, SolveResult } from './missions/solvers';
+import { lessonFilled } from './missions/missions';
 import { status as gitStatus } from './sim/git';
 import { complianceFindings, collectEvidence, enableAuditStore, revokeSudo, installMesh, setMtlsStrict, enablePortal, publishTemplate, enableTracing, analyzeTraces, enablePooler, dueDiligence, acceptTermSheet } from './world';
 import { randomUUID } from 'crypto';
@@ -744,7 +745,8 @@ export function createApi(storage: Storage): Router {
           skills: m.skills,
           hintsUsed: state.missions.hintsUsed[m.id] ?? 0,
           hintsTotal: m.hints.length,
-          requirements: evalRequirements(m, w)
+          requirements: evalRequirements(m, w),
+          lesson: m.lesson ? lessonFilled(m.lesson, w) : null
         } : null,
         pack: (() => {
           const pm = currentPackMission(state);

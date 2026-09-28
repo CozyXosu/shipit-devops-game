@@ -3,7 +3,7 @@
 Concise snapshot of the repository's working state for future coding sessions.
 Source of truth for design/roadmap: `docs/DESIGN.md`. If anything here looks stale,
 verify against the repo (`git status --short`, recent log, actual files) — never
-trust it blindly. Last updated: 2026-09-28 (auto-solve committed & pushed).
+trust it blindly. Last updated: 2026-09-28 (lesson system + editor hand-holding).
 
 ## Project / Version
 
@@ -46,6 +46,18 @@ trust it blindly. Last updated: 2026-09-28 (auto-solve committed & pushed).
   outage (errors pinned at 80% block resolution); m40 re-commits an honest SLO
   target when the 99.5% budget was burned by provider outages (uptimeBadMin
   decays only 1/240 per good minute — waiting it out is not viable).
+- **Lesson system** (`server/src/missions/lessons.ts` + UI): free teaching
+  content for the 13 file-authoring missions (m04, m06, m07, m08, m09, m10,
+  m13, m17, m18, m19, m34, m35, m38). Each lesson = intro prose (what the
+  format is and why), syntax cheat-sheet table, annotated line-by-line
+  examples, a "where" note, and (8 missions) a commented TODO **starter**
+  scaffold. Attached to MissionDef via an id-keyed loop at the bottom of
+  missions.ts; exposed as `lesson` in the view-model (`lessonFilled` resolves
+  `{domain}` templates). Mission dock renders it as a collapsible 📘 panel
+  between coaching and checklist — never costs a hint or rating. Starters are
+  safe against false requirement passes: every sim parser skips `#` comments
+  except nginx (regex over raw text) and the logrotate flag check, whose two
+  starters therefore use prose-only TODOs.
 - P5a security arc: `sim/vault.ts` (vault CLI: put/lease/rotate/scan),
   zero-trust mesh + STRICT mTLS (world.ts + CLOUD panel), NetworkPolicy +
   admission Policy manifest kinds + `cosign` CLI (host.ts, k8s.ts, docker
@@ -59,6 +71,10 @@ trust it blindly. Last updated: 2026-09-28 (auto-solve committed & pushed).
   scale event, legend mode — COMPANY tab panel).
 - Frontend (`web/src/`): React SPA — terminal, editors, cloud console, mission
   UI, PORTAL tab, accessibility, EN/ES/DE chrome (portal tab localized too).
+  EDITOR: recursive file tree (subfolders like `.ci/` and `k8s/` navigable —
+  they were unreachable before), `＋ New file` creation (no more terminal
+  `touch` dance), and a `📘 Mission starter` button when the current mission
+  has a starter scaffold.
 - Storage: JSON file `data/games.json` by default; optional Postgres via
   `SHIPIT_PG_URL` behind the async `Storage` seam (`db/schema.sql`).
 - Tests: 15 vitest suites (159 tests). `tests/p5.test.ts` plays the whole
@@ -123,15 +139,20 @@ trust it blindly. Last updated: 2026-09-28 (auto-solve committed & pushed).
 
 ### Objective
 
-Auto-solve feature shipped, committed and pushed to `main`: a `⚡ Solve it for me`
-button on every career mission and the tournament pack track. Each click plays
-the mission's canonical solution server-side and shows a step-by-step
-transcript of what it did. Verified: root/web `tsc --noEmit` clean, `npm test`
-159/159 (15 files, incl. the full auto-solve chain test), live HTTP smoke test
-(create → solve m01/m02 → graceful pack fallback → delete), live save
-untouched.
+Beginner-education pass shipped on top of `main` (uncommitted): lesson system
+for file-authoring missions + editor hand-holding (recursive tree, new-file
+creation, starter scaffolds). Verified: root/web `tsc --noEmit` clean,
+`npm test` 159/159, live HTTP smoke (lesson in view-model, `{domain}` fill,
+starter save does not falsely pass requirements), browser UI check (lesson
+panel renders in the dock; starter → scaffold in editor → SAVE → file in
+tree; new-file flow works; no dock overflow). Test games deleted; live saves
+untouched; temp servers killed. The user's own dev server on :4100 was
+running pre-change code during testing — it serves stale mission data until
+restarted (harmless: new fields are optional and the UI tolerates their
+absence).
 
-Prior state: P5 fully shipped and released as v0.4 (`05e8c02`, pushed).
+Prior state: auto-solve feature committed and pushed to `main`; v0.4 released
+(`05e8c02`).
 
 ### Expected Outcome
 

@@ -1,5 +1,5 @@
 // Game views: terminal, editor, dashboard, CI, database, monitoring, cloud, costs, postmortems.
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { api, GameView, FsEntry, OutLine, SqlResult } from './lib/api';
 import { MetricCard, Spark, highlight } from './lib/ui';
 
@@ -103,27 +103,90 @@ function langFor(path: string): string {
   return 'conf';
 }
 
-export function Editor({ game, refresh }: { game: string; refresh: Refresh }) {
+/** Recursive file-tree nodes — makes subfolders (.ci/, k8s/) navigable. */
+function TreeNodes({ base, entries, sel, onOpen, depth }: { base: string; entries: FsEntry[] | null; sel: string | null; onOpen: (p: string) => void; depth: number }) {
+  return (
+    <>
+      {(entries ?? []).map((e) => {
+        const path = `${base}/${e.name}`;
+        if (e.type === 'dir') {
+          return (
+            <div key={path}>
+              <div className="dir" style={{ paddingLeft: depth * 12 }}>▸ {e.name}/</div>
+              <TreeNodes base={path} entries={e.children ?? null} sel={sel} onOpen={onOpen} depth={depth + 1} />
+            </div>
+          );
+        }
+        return (
+          <div key={path} className={`file ${sel === path ? 'sel' : ''}`} style={{ paddingLeft: depth * 12 + 18 }} onClick={() => onOpen(path)}>
+            <span>· {e.name}</span>
+            <span className="meta">{e.owner}:{e.mode}</span>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+export function Editor({ game, view, refresh }: { game: string; view?: GameView; refresh: Refresh }) {
   const [trees, setTrees] = useState<Record<string, FsEntry[] | null>>({});
   const [sel, setSel] = useState<string | null>(null);
   const [content, setContent] = useState('');
   const [orig, setOrig] = useState('');
+  const [isNew, setIsNew] = useState(false);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [saved, setSaved] = useState(false);
+  const [showNew, setShowNew] = useState(false);
+  const [newPath, setNewPath] = useState('');
 
-  useEffect(() => {
+  const starter = view?.missions.current?.lesson?.starter ?? null;
+
+  const loadTrees = useCallback(() => {
     for (const root of TREE_ROOTS) {
       api.fs(game, root).then((r) => setTrees((t) => ({ ...t, [root]: r.entries })));
     }
   }, [game]);
 
+  useEffect(() => { loadTrees(); }, [loadTrees]);
+
   const open = async (path: string) => {
-    const f = await api.readFile(game, path);
+    try {
+      const f = await api.readFile(game, path);
+      setSel(path);
+      setContent(f.content);
+      setOrig(f.content);
+      setIsNew(false);
+      setWarnings([]);
+      setSaved(false);
+    } catch { /* a directory or missing file — nothing to open */ }
+  };
+
+  const openNew = (path: string, initial = '') => {
     setSel(path);
-    setContent(f.content);
-    setOrig(f.content);
+    setContent(initial);
+    setOrig(initial);
+    setIsNew(true);
     setWarnings([]);
     setSaved(false);
+  };
+
+  const openStarter = () => {
+    if (!starter) return;
+    setShowNew(false);
+    openNew(starter.path, starter.content);
+  };
+
+  const createFile = () => {
+    const p = newPath.trim();
+    if (!p) return;
+    if (!TREE_ROOTS.some((r) => p.startsWith(`${r}/`))) {
+      setWarnings([`${p}: outside the folders this editor manages (${TREE_ROOTS.join(', ')})`]);
+      return;
+    }
+    setWarnings([]);
+    openNew(p);
+    setNewPath('');
+    setShowNew(false);
   };
 
   const save = async () => {
@@ -131,7 +194,9 @@ export function Editor({ game, refresh }: { game: string; refresh: Refresh }) {
     const r = await api.writeFile(game, sel, content);
     setWarnings(r.warnings ?? []);
     setOrig(content);
+    setIsNew(false);
     setSaved(true);
+    loadTrees();
     refresh();
   };
 
@@ -144,27 +209,48 @@ export function Editor({ game, refresh }: { game: string; refresh: Refresh }) {
         {TREE_ROOTS.map((root) => (
           <div key={root}>
             <div className="dir">▸ {root}</div>
-            {(trees[root] ?? []).map((e) => (
-              <div key={e.name} className={`file ${sel === `${root}/${e.name}` ? 'sel' : ''}`} onClick={() => open(`${root}/${e.name}`)}>
-                <span>{e.type === 'dir' ? '▸' : '·'} {e.name}</span>
-                <span className="meta">{e.owner}:{e.mode}</span>
-              </div>
-            ))}
+            <TreeNodes base={root} entries={trees[root]} sel={sel} onOpen={open} depth={1} />
             {trees[root] === null ? <div className="dimtxt" style={{ padding: '2px 18px' }}>(not present yet)</div> : null}
           </div>
         ))}
-        <div className="dimtxt" style={{ padding: '10px 6px', lineHeight: 1.5 }}>
-          Create new files (e.g. .env, .gitignore, Dockerfile, configs) with the terminal:<br />
-          <code style={{ color: 'var(--green)' }}>touch /opt/app/Dockerfile</code> — then reload this tab.
+        <div style={{ padding: '10px 4px 4px' }}>
+          {showNew ? (
+            <div className="newfile">
+              <div className="dimtxt" style={{ marginBottom: 4 }}>New file — full path:</div>
+              <input
+                value={newPath}
+                onChange={(e) => setNewPath(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') createFile(); if (e.key === 'Escape') setShowNew(false); }}
+                placeholder="/opt/app/Dockerfile"
+                spellCheck={false}
+                aria-label="new file path"
+              />
+              <div className="row" style={{ marginTop: 6 }}>
+                <button className="primary" onClick={createFile}>CREATE</button>
+                <button onClick={() => setShowNew(false)}>✕</button>
+              </div>
+              <div className="dimtxt" style={{ fontSize: 11, lineHeight: 1.4, marginTop: 4 }}>
+                Must live inside: {TREE_ROOTS.join(' · ')}
+              </div>
+            </div>
+          ) : (
+            <button style={{ width: '100%' }} onClick={() => { setShowNew(true); setNewPath(starter ? starter.path : ''); }}>＋ New file</button>
+          )}
+          {starter && (
+            <button style={{ width: '100%', marginTop: 6 }} onClick={openStarter} title={starter.path}>
+              📘 Mission starter: {starter.path.split('/').pop()}
+            </button>
+          )}
         </div>
       </div>
       <div className="code-area">
         <div className="code-head">
           <span>{sel ?? 'select a file'}</span>
-          {sel && content !== orig && <span style={{ color: 'var(--yellow)' }}>● modified</span>}
+          {isNew && <span style={{ color: 'var(--blue)' }}>● new file</span>}
+          {sel && !isNew && content !== orig && <span style={{ color: 'var(--yellow)' }}>● modified</span>}
           {saved && content === orig && <span style={{ color: 'var(--green)' }}>saved</span>}
           <span className="spacer" style={{ flex: 1 }} />
-          <button className="primary" disabled={!sel || content === orig} onClick={save}>SAVE</button>
+          <button className="primary" disabled={!sel || (!isNew && content === orig)} onClick={save}>SAVE</button>
         </div>
         <div className="code-body">
           <div className="code-gutter">
@@ -174,7 +260,7 @@ export function Editor({ game, refresh }: { game: string; refresh: Refresh }) {
             value={content}
             onChange={(e) => { setContent(e.target.value); setSaved(false); }}
             spellCheck={false}
-            placeholder={sel ? '' : 'Open a file from the tree on the left.'}
+            placeholder={sel ? '' : 'Open a file from the tree on the left — or create one with ＋ New file.'}
           />
         </div>
         {warnings.length > 0 && (

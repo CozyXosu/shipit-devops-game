@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, GameSummary, GameView, SolveResult } from './lib/api';
+import { api, GameSummary, GameView, SolveResult, LessonView } from './lib/api';
 import { isLocale, Locale, makeT } from './lib/i18n';
 import { Terminal, Editor, Dashboard, CiView, DbView, Monitoring, Cloud, Costs, Postmortems, K8sView, Company, Modes, Portal } from './views';
 
@@ -238,7 +238,7 @@ function GameShell({ gameId, view, setView, onExit, t, locale, setLocale, a11y, 
         <div className="content">
           {tab === 'missions' && <MissionsTab view={view} t={t} />}
           {tab === 'terminal' && <Terminal game={gameId} view={view} refresh={refresh} />}
-          {tab === 'editor' && <Editor game={gameId} refresh={refresh} />}
+          {tab === 'editor' && <Editor game={gameId} view={view} refresh={refresh} />}
           {tab === 'dashboard' && <Dashboard view={view} />}
           {tab === 'ci' && <CiView game={gameId} view={view} refresh={refresh} />}
           {tab === 'k8s' && <K8sView view={view} />}
@@ -380,6 +380,41 @@ function useSolver(gameId: string, pack: boolean) {
   return { solving, result, solve };
 }
 
+/** Free teaching content for file-authoring missions: what the format is,
+ *  a syntax cheat-sheet, and annotated examples. Never costs a hint. */
+function LessonPanel({ lesson, t }: { lesson: LessonView; t: (key: string) => string }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="lesson">
+      <button className="lesson-head" onClick={() => setOpen(!open)} aria-expanded={open}>
+        <span>📘 {t('dock.lesson')}</span>
+        <span className="dimtxt">{t('dock.lesson.free')} · {open ? '▾' : '▸'}</span>
+      </button>
+      {open && (
+        <>
+          <div className="lesson-intro">{lesson.intro}</div>
+          {lesson.syntax && lesson.syntax.length > 0 && (
+            <table className="lesson-syntax">
+              <tbody>
+                {lesson.syntax.map((r, i) => (
+                  <tr key={i}><td><code>{r.term}</code></td><td>{r.text}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {lesson.examples?.map((ex, i) => (
+            <div key={i}>
+              <div className="lesson-ex-label">{ex.label}</div>
+              <pre className="lesson-code">{ex.code}</pre>
+            </div>
+          ))}
+          {lesson.where && <div className="lesson-where">📁 {lesson.where}</div>}
+        </>
+      )}
+    </div>
+  );
+}
+
 function MissionBody({ view, t, full, onOpen }: { view: GameView; t: (key: string) => string; full?: boolean; onOpen?: () => void; game?: string }) {
   const m = view.missions.current;
   const [hint, setHint] = useState<string | null>(null);
@@ -425,6 +460,7 @@ function MissionBody({ view, t, full, onOpen }: { view: GameView; t: (key: strin
       <div className="story">{m.story}</div>
       <div className="objective">▸ {m.objective}</div>
       <div className="coaching">Where to start: {m.coaching}</div>
+      {m.lesson && <LessonPanel lesson={m.lesson} t={t} />}
 
       <div style={{ marginTop: 10 }}>
         {m.requirements.map((r) => (

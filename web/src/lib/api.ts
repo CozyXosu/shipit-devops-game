@@ -5,6 +5,13 @@ export interface OutLine { text: string; cls?: 'err' | 'ok' | 'dim' | 'hdr' | 'w
 export interface GameSummary { id: string; name: string; day: number; updatedAt: number }
 
 export interface ReqResult { id: string; label: string; pass: boolean }
+export interface LessonView {
+  intro: string;
+  syntax?: { term: string; text: string }[];
+  examples?: { label: string; code: string }[];
+  where?: string;
+  starter?: { path: string; content: string };
+}
 
 export interface SolveStep { kind: 'cmd' | 'write' | 'action' | 'wait' | 'note'; label: string; detail?: string; output?: string; minutes?: number }
 
@@ -38,6 +45,7 @@ export interface GameView {
     current: {
       id: string; title: string; story: string; objective: string; coaching: string;
       skills: string[]; hintsUsed: number; hintsTotal: number; requirements: ReqResult[];
+      lesson: LessonView | null;
     } | null;
     pack: {
       id: string; title: string; story: string; objective: string; coaching: string;

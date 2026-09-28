@@ -21,6 +21,7 @@ export interface MissionDef {
   skills: string[];
   requirements: Requirement[];
   hints: string[];
+  lesson?: Lesson;
   rewards: { cash: number; xp: Record<string, number>; tournamentPoints?: number };
   onStart?: (w: World) => void;
   onComplete?: (w: World) => void;
@@ -57,6 +58,7 @@ function missionApiContainer(w: World): boolean {
 // MISSIONS
 // =====================================================================
 import { k8sServes, imageSigned } from '../sim/k8s';
+import { LESSONS, Lesson } from './lessons';
 
 export const MISSIONS: MissionDef[] = [
   // -------------------------------------------------------- 1
@@ -1293,3 +1295,22 @@ export const MISSIONS: MissionDef[] = [
     }
   }
 ];
+
+// Attach free teaching content (file-format lessons) to authoring missions.
+for (const m of MISSIONS) {
+  const l = LESSONS[m.id];
+  if (l) m.lesson = l;
+}
+
+/** Lesson with {domain} templates resolved for the view-model. */
+export function lessonFilled(l: Lesson, w: World): Lesson {
+  const fill = (s: string) => s.replaceAll('{domain}', domain(w));
+  return {
+    ...l,
+    intro: fill(l.intro),
+    where: l.where ? fill(l.where) : undefined,
+    syntax: l.syntax?.map((r) => ({ term: fill(r.term), text: fill(r.text) })),
+    examples: l.examples?.map((e) => ({ label: fill(e.label), code: fill(e.code) })),
+    starter: l.starter ? { path: fill(l.starter.path), content: fill(l.starter.content) } : undefined
+  };
+}
