@@ -16,9 +16,10 @@ trust it blindly. Last updated: 2026-09-28 (P5 session).
 
 ## Git
 
-- Branch `main`. Last release: `47c4668` (v0.3, 32-mission game, pushed).
-- Uncommitted local work: P5 ("Trust & Scale") implementation — missions
-  m33–m40, sims, UI, tests, docs (this session). Not committed, not pushed.
+- Branch `main`. Last release: `05e8c02` (v0.4, 40-mission game, pushed to
+  github.com/CozyXosu/shipit-devops-game). Working tree clean.
+- History: `47c4668` (v0.3, P1–P4) → `b034a6f` (agent workflow + P5 proposal)
+  → `05e8c02` (v0.4, P5).
 - `data/` is gitignored: live save games are NOT in git.
 
 ## Implemented (verified)
@@ -110,13 +111,12 @@ the endgame via the due-diligence data room.
 
 Final Verification (2026-09-28, this session): root `tsc --noEmit` clean,
 `web/` `tsc --noEmit` clean, `npm test` 150/150 passed (14 files), live save
-load-tested. Fully verified.
+load-tested. Fully verified. Committed as `05e8c02` and pushed to origin/main.
 
 ### Expected Outcome
 
-Next session: commit/push P5 as v0.4 when the user asks; then pick from the
-deferred list (multiplayer/leaderboards, mobile/PWA, data engineering, more
-localizations) or new pitches.
+Next session: pick from the deferred list (multiplayer/leaderboards, mobile/
+PWA, data engineering, more localizations) or new pitches.
 
 ### Do Not Touch
 
