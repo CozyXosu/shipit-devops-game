@@ -43,7 +43,7 @@ export interface GameView {
     completed: string[];
     phaseComplete: boolean;
     current: {
-      id: string; title: string; story: string; objective: string; coaching: string;
+      id: string; title: string; story: string; objective: string; coaching: string; realWorld: string | null;
       skills: string[]; hintsUsed: number; hintsTotal: number; requirements: ReqResult[];
       lesson: LessonView | null;
     } | null;

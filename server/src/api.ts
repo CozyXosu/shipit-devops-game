@@ -742,6 +742,7 @@ export function createApi(storage: Storage): Router {
           story: fillTemplate(m.story, w),
           objective: fillTemplate(m.objective, w),
           coaching: fillTemplate(m.coaching, w),
+          realWorld: m.realWorld ? fillTemplate(m.realWorld, w) : null,
           skills: m.skills,
           hintsUsed: state.missions.hintsUsed[m.id] ?? 0,
           hintsTotal: m.hints.length,

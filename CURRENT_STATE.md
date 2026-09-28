@@ -3,7 +3,7 @@
 Concise snapshot of the repository's working state for future coding sessions.
 Source of truth for design/roadmap: `docs/DESIGN.md`. If anything here looks stale,
 verify against the repo (`git status --short`, recent log, actual files) — never
-trust it blindly. Last updated: 2026-09-28 (lesson system + editor hand-holding).
+trust it blindly. Last updated: 2026-09-28 (real-world curriculum layer + polish).
 
 ## Project / Version
 
@@ -12,7 +12,7 @@ trust it blindly. Last updated: 2026-09-28 (lesson system + editor hand-holding)
   K8s/Terraform/cloud workflows, mission by mission.
 - Version v0.4, roadmap P0–P5 all shipped (see `docs/DESIGN.md` §12).
   40 missions built (m01–m40).
-- `package.json` version string still reads `0.1.0` — cosmetic, never bumped.
+- `package.json` version reads `0.4.1` (bumped 2026-09-28 from the stale 0.1.0).
 
 ## Git
 
@@ -58,6 +58,15 @@ trust it blindly. Last updated: 2026-09-28 (lesson system + editor hand-holding)
   safe against false requirement passes: every sim parser skips `#` comments
   except nginx (regex over raw text) and the logrotate flag check, whose two
   starters therefore use prose-only TODOs.
+- **Real-world curriculum layer** (`REAL_WORLD` in missions.ts + UI): every
+  career mission m01–m40 carries a one-to-two-sentence "In a real job" note
+  (transferable skill + real tool names, `{domain}` templates filled). Exposed
+  as `realWorld` in the view-model, rendered in the mission dock between
+  coaching and the lesson panel (blue-left-border block + RW tag, a11y-lg aware).
+  `tests/realworld.test.ts` guards coverage (every mission has a note; no
+  orphan keys) — 161 tests total. Curriculum map + honest gap list:
+  `docs/CURRICULUM.md` (what the game teaches vs. the 12 things a real job
+  needs that the sim does not cover).
 - P5a security arc: `sim/vault.ts` (vault CLI: put/lease/rotate/scan),
   zero-trust mesh + STRICT mTLS (world.ts + CLOUD panel), NetworkPolicy +
   admission Policy manifest kinds + `cosign` CLI (host.ts, k8s.ts, docker
@@ -77,7 +86,7 @@ trust it blindly. Last updated: 2026-09-28 (lesson system + editor hand-holding)
   has a starter scaffold.
 - Storage: JSON file `data/games.json` by default; optional Postgres via
   `SHIPIT_PG_URL` behind the async `Storage` seam (`db/schema.sql`).
-- Tests: 15 vitest suites (159 tests). `tests/p5.test.ts` plays the whole
+- Tests: 16 vitest suites (161 tests). `tests/p5.test.ts` plays the whole
   m33→m40 chain plus units (admission denial, vault scan, findings mapping).
   `tests/solve.test.ts` auto-solves the entire m01→m40 career chain plus the
   tournament pack track mission-by-mission (~0.5s wall clock).
@@ -95,8 +104,9 @@ trust it blindly. Last updated: 2026-09-28 (lesson system + editor hand-holding)
 - m08 env-file check accepts a commented-out `DB_PASSWORD=` line (quirk).
 - `git init -q` parses `-q` as a path (repo at `/opt/app/-q`) — sim quirk;
   tests use plain `git init`.
-- Mission dock's "every mission complete" text still describes P4 content
-  (cosmetic; legend-mode audit line covers the P5 ending).
+- `data/games.json` currently holds a few stray games named "test" (day 24,
+  created outside this session) alongside live save `69a00316` — left alone
+  per save-file policy; delete from the UI if unwanted.
 
 ## Architecture Facts
 
@@ -139,25 +149,27 @@ trust it blindly. Last updated: 2026-09-28 (lesson system + editor hand-holding)
 
 ### Objective
 
-Beginner-education pass shipped on top of `main` (uncommitted): lesson system
-for file-authoring missions + editor hand-holding (recursive tree, new-file
-creation, starter scaffolds). Verified: root/web `tsc --noEmit` clean,
-`npm test` 159/159, live HTTP smoke (lesson in view-model, `{domain}` fill,
-starter save does not falsely pass requirements), browser UI check (lesson
-panel renders in the dock; starter → scaffold in editor → SAVE → file in
-tree; new-file flow works; no dock overflow). Test games deleted; live saves
-untouched; temp servers killed. The user's own dev server on :4100 was
-running pre-change code during testing — it serves stale mission data until
-restarted (harmless: new fields are optional and the UI tolerates their
-absence).
+Learning-coverage pass shipped on top of `main` (uncommitted): a real-world
+mapping note on every career mission ("In a real job": transferable skill +
+real tool names), the curriculum map + honest gap list in
+`docs/CURRICULUM.md`, and polish (dock completion text now covers P5,
+`package.json` → 0.4.1). Verified: root/web `tsc --noEmit` clean, `npm test`
+161/161 (incl. new `tests/realworld.test.ts` coverage guard), live HTTP smoke
+on the restarted :4100 server (realWorld in view-model; smoke game deleted;
+two pre-existing stray "test" games left alone). User's dev server on :4100
+was killed and restarted with current code; `web/dist` rebuilt so the static
+UI served there includes the new dock block.
 
-Prior state: auto-solve feature committed and pushed to `main`; v0.4 released
-(`05e8c02`).
+Prior state: lesson system + editor hand-holding committed as `a3956fc`,
+README refresh `acf2d6d`; v0.4 released (`05e8c02`).
 
 ### Expected Outcome
 
-Next session: pick from the deferred list (multiplayer/leaderboards, mobile/
-PWA, data engineering, more localizations) or new pitches.
+Commit the learning-coverage pass when the user is happy with it. Next
+content direction: pick from the deferred list (multiplayer/leaderboards,
+mobile/PWA, data engineering, more localizations) or close curriculum gaps
+from `docs/CURRICULUM.md` as new missions (caching, queues, load testing,
+GitOps, feature flags — would each need a small sim engine).
 
 ### Do Not Touch
 

@@ -18,6 +18,8 @@ export interface MissionDef {
   story: string;
   objective: string;
   coaching: string;
+  /** How this maps to a real DevOps job: the transferable skill + real tools. */
+  realWorld?: string;
   skills: string[];
   requirements: Requirement[];
   hints: string[];
@@ -1297,9 +1299,56 @@ export const MISSIONS: MissionDef[] = [
 ];
 
 // Attach free teaching content (file-format lessons) to authoring missions.
+// Real-world mapping for every mission: what this task is called in an actual
+// DevOps/SRE/platform job and which real tools it corresponds to. Shown in the
+// mission dock next to the coaching line. {domain} templates are filled.
+export const REAL_WORLD: Record<string, string> = {
+  'm01-ssh': 'Every DevOps job starts here: you inherit servers someone else built. The interview task "walk me through investigating an unfamiliar machine" is exactly this. Real tools: OpenSSH, systemd journal, /etc.',
+  'm02-dead-api': 'Production debugging is most of the job. Process → logs → config is the same loop whether the app is Node, Java or Go. Real tools: systemctl, journalctl, tail -f; Sentry or Datadog once errors reach a dashboard.',
+  'm03-permissions': 'Half of all "the app is broken" tickets are Unix permissions in a fake moustache. chmod/chown, service users, and why running as root is a smell — you will use this weekly.',
+  'm04-nginx': 'The reverse proxy is the most-deployed software you are never paid to notice. nginx, Caddy, HAProxy or a cloud ALB share these exact concepts — and in real life TLS terminates here too.',
+  'm05-dns': 'DNS breakage looks like the network being on fire. A/CNAME/TTL and propagation explain every "works on my machine". Real tools: Route 53, Cloud DNS, dig.',
+  'm06-git': 'Git is table stakes for every technical job, not just DevOps. Branch → commit → pull request → review is the daily loop; the history stays clean because you never commit what you cannot explain.',
+  'm07-branch': 'Merge conflicts are normal; panic is not. Reading the markers, resolving from the right side, never committing half a resolution. Real life adds rebase-vs-merge politics — the mechanics are identical.',
+  'm08-secrets': 'Committed credentials are the #1 finding in every security audit — GitGuardian runs a whole business on finding them. The fix (env vars, secret managers, .gitignore) is universal. At work: rotate first, clean history second.',
+  'm09-docker': 'The container is the unit of deployment everywhere now. Dockerfile layers, why instruction order is a cache strategy, images as immutable artifacts. Next steps in real life: multi-stage builds and distroless images.',
+  'm10-ci': 'CI is how a team stops arguing about whose machine works. Pipelines as code, test gates, build artifacts. Real tools: GitHub Actions, GitLab CI, Jenkins — different YAML dialects, identical shape.',
+  'm11-db': '"Do not run your own database" is the first managed service every company buys. Connection strings, migrations, and the app/DB split. Real tools: RDS, Cloud SQL, Neon/Supabase.',
+  'm12-monitoring': 'You cannot operate what you cannot see. Metrics → dashboards → alerts is the observability backbone; the craft is alerting on symptoms users feel, not causes. Real tools: Prometheus + Grafana, Datadog, CloudWatch.',
+  'm13-disk': 'Your first real incident will be something dumb, like a disk full of logs. Mitigate, fix the cause, then write it up — that discipline is the actual skill. Real tools: logrotate, Loki/ELK, PagerDuty.',
+  'm14-baddeploy': 'A deploy system is judged by its rollback story. Automate deploys so you can automate the way back. Real tools: kubectl rollout undo, blue/green switch, `git revert` + pipeline.',
+  'm15-dbperf': 'The five-figure query is usually one missing index. Reading the query plan before guessing is the transferable skill. Real tools: EXPLAIN ANALYZE, pg_stat_statements, slow-query log.',
+  'm16-ha': 'Single servers fail; the answer is redundancy plus a load balancer plus health checks. Killing a box on purpose to prove the design is real SRE practice — Netflix open-sourced this genre as Chaos Monkey.',
+  'm17-e2e': 'A staging environment that differs from production is theater. E2E tests plus a human approval gate is the standard path to prod — and the part auditors love. Real tools: Playwright/Cypress, GitHub Environments.',
+  'm18-terraform': 'Console clicks do not scale and cannot be reviewed. Terraform plan/apply and drift detection are the industry lingua franca (OpenTofu and Pulumi are dialects of the same idea).',
+  'm19-k8s': 'Kubernetes is the operating system of the cloud. Deployments, liveness/readiness probes, HPA — this is the vocabulary of every platform job posting. Real tools: kubectl, EKS/GKE/AKS.',
+  'm20-dr': 'A backup you have never restored is a rumor. RPO/RTO are how businesses buy continuity; restore drills keep the rumor honest. Real tools: pgBackRest, snapshots, AWS Backup.',
+  'm21-team': 'DevOps is a team sport with a pager. On-call rotations, escalation paths and fair pay for the on-call burden are the org-design half of the job. Real tools: PagerDuty/Opsgenie schedules.',
+  'm22-debt': 'Tech debt is a portfolio to manage, not a sin to confess. Track it, price the interest (this game ties it to incident probability), schedule the paydown — that is how staff engineers think.',
+  'm23-canary': 'Progressive delivery: send 5% of traffic to the new version, watch, promote or abort. Canary and blue-green are standard anywhere with real traffic. Real tools: Argo Rollouts, Flagger, weighted ALB targets.',
+  'm24-slo': 'SLOs turn "reliable enough" into a number with a budget — when the budget burns, the team stops shipping features and buys reliability back. Google\'s SRE workbook covers this free online.',
+  'm25-clouds': 'Multi-cloud is a pricing/reliability negotiation, and provider outages are when SLA credits exist. Real life: AWS/Azure/GCP publish status pages and SLAs — read them before you sign anything.',
+  'm26-migrate': 'Lift-and-shift vs re-platform, and why preparation shrinks the cutover window: migration projects are the quarter-long staple of infrastructure consulting.',
+  'm27-products': 'Platform engineers serve internal customers, and productizing (tiers, SSO, SLAs) is how internal tooling earns budget. Enterprise always asks for SSO and an SLA first.',
+  'm28-finops': 'FinOps is the fastest-growing slice of the job: unit economics (cost per customer), rightsizing from utilization, reserved commitments. Real tools: AWS Cost Explorer, OpenCost, Infracost.',
+  'm29-packs': 'You just used a declarative requirement DSL over world state — the same pattern as Terraform Sentinel policies and Kubernetes admission rules. Building tools other people author content for is platform engineering.',
+  'm30-tournament': 'Blameless postmortems and MTTR are the incident-response canon; corrective actions with owners beat "be more careful" every time. Read: Google SRE book, postmortem chapter.',
+  'm31-challenge': 'Constraints are the job: an austerity budget cap, a windowed availability audit, an RTO stopwatch. This is what production readiness reviews and game days feel like.',
+  'm32-access': 'Accessibility and i18n are launch requirements in real products — and law in some markets. WCAG is the reference document; inclusive engineering is part of the platform craft.',
+  'm33-vault': 'Dynamic secrets with leases beat static .env files: short-lived credentials shrink the blast radius of every leak, and rotation stops being a fire drill. Real tools: HashiCorp Vault, AWS Secrets Manager.',
+  'm34-zerotrust': '"Never trust, always verify": mTLS between services, default-deny network policy, non-root containers. Real tools: Istio/Linkerd, Cilium/Calico, Pod Security Standards.',
+  'm35-supplychain': 'You are what you ship: signed images, SBOMs, and a cluster that physically refuses unsigned artifacts. Real tools: Sigstore/cosign, Trivy/Grype, Kyverno/OPA — the post-SolarWinds consensus.',
+  'm36-audit': 'SOC 2 / ISO 27001 audits are won with evidence, not intentions: access reviews, append-only audit logs, evidence bundles on demand. Compliance engineering is a career path now.',
+  'm37-portal': 'Internal developer portals with golden paths treat the platform as a product. Backstage is the open-source standard; time-to-first-deploy is the metric that funds it.',
+  'm38-previews': 'An ephemeral environment per pull request kills the "works on my machine" debate permanently. Real tools: Vercel/Netlify previews, ephemeral namespaces — every mature platform has a version of this.',
+  'm39-tracing': 'Logs tell you what broke; traces tell you where. Connection pooling (pgbouncer) is the classic fix for Postgres connection storms. Real tools: OpenTelemetry, Jaeger/Tempo, Honeycomb.',
+  'm40-acquisition': 'Due diligence over architecture, security, FinOps and team is what buyers actually audit before an acquisition — and now you have sat on both sides of the table.'
+};
+
 for (const m of MISSIONS) {
   const l = LESSONS[m.id];
   if (l) m.lesson = l;
+  m.realWorld = REAL_WORLD[m.id];
 }
 
 /** Lesson with {domain} templates resolved for the view-model. */
