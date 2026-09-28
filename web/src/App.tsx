@@ -118,10 +118,6 @@ function Landing({ t, games, onEnter, onCreate, onDelete }: {
         <label>{t('landing.founder')}</label>
         <input aria-label={t('landing.founder')} placeholder="Jordan" value={founder} onChange={(e) => setFounder(e.target.value)} />
         <div className="modes">
-          <div className={`mode ${mode === 'tutorial' ? 'sel' : ''}`} onClick={() => setMode('tutorial')} role="button" tabIndex={0}
-            onKeyDown={(e) => { if (e.key === 'Enter') setMode('tutorial'); }}>
-            <b>{t('landing.mode.tutorial')}</b><small>{t('landing.mode.tutorial.sub')}</small>
-          </div>
           <div className={`mode ${mode === 'career' ? 'sel' : ''}`} onClick={() => setMode('career')} role="button" tabIndex={0}
             onKeyDown={(e) => { if (e.key === 'Enter') setMode('career'); }}>
             <b>{t('landing.mode.career')}</b><small>{t('landing.mode.career.sub')}</small>
@@ -440,7 +436,14 @@ function MissionBody({ view, t, full, onOpen }: { view: GameView; t: (key: strin
           You survived a disk-full, a bad deploy, a dropped database, console drift and a leaky canary.
           <br /><br />
           You scaled it: providers, migrations, products, FinOps — then packs, a tournament,
-          challenges under constraint, and a UI that works for everyone. The world keeps happening.
+          challenges under constraint, and a UI that works for everyone.
+          <br /><br />
+          Then you hardened it: secrets in a vault, a zero-trust mesh, a signed supply chain,
+          an audit the auditor believed — and ran it like a platform team: a portal with golden
+          paths, a preview environment per pull request, traces to the slow query, and finally
+          the acquisition, clean.
+          <br /><br />
+          The world keeps happening.
         </div>
         {view.missions.summaries.length > 0 && (
           <div className="mlist">
@@ -460,6 +463,7 @@ function MissionBody({ view, t, full, onOpen }: { view: GameView; t: (key: strin
       <div className="story">{m.story}</div>
       <div className="objective">▸ {m.objective}</div>
       <div className="coaching">Where to start: {m.coaching}</div>
+      {m.realWorld && <div className="realworld"><span className="rwtag">In a real job</span>{m.realWorld}</div>}
       {m.lesson && <LessonPanel lesson={m.lesson} t={t} />}
 
       <div style={{ marginTop: 10 }}>
