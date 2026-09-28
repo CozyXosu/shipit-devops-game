@@ -221,7 +221,7 @@ The engine polls requirements after every mutating action and each tick;
 the UI renders the live checklist. Completion → rating (S/A/B/C from hints +
 failed attempts + sim-time), reward modal, next mission, audit entry.
 
-## 10. The Mission Curriculum (24)
+## 10. The Mission Curriculum (40)
 
 ✅ = playable in the shipped build (P0 + P1 + P2).
 
@@ -259,6 +259,14 @@ failed attempts + sim-time), reward modal, next mission, audit entry.
 | 30 | **The postmortem tournament** | five scored incident rounds (MTTR, corrective actions, credits, restores) vs rival teams | ✅ |
 | 31 | **The constraints game** | challenge mode: budget cap / windowed availability / RTO under a surprise disaster | ✅ |
 | 32 | **Everyone ships** | accessibility (contrast, text size, motion, keyboard) + interface localization (EN/ES/DE) | ✅ |
+| 33 | **The keys to the kingdom** | secrets manager: managed secrets, dynamic DB credentials, zero-downtime rotation, leak scan | ✅ |
+| 34 | **Nobody gets root** | zero trust: service identities + STRICT mTLS, default-deny NetworkPolicy, runAsNonRoot | ✅ |
+| 35 | **Chain of custody** | supply chain: cosign signing, SBOM attestations, admission policy blocking unsigned images | ✅ |
+| 36 | **The auditor cometh** | compliance: access review, append-only audit store, live findings, evidence bundles | ✅ |
+| 37 | **Golden paths** | internal developer portal: self-service deploy templates, devs shipping without tickets | ✅ |
+| 38 | **Every PR gets a stage** | ephemeral preview environments per CI run with auto-destroy | ✅ |
+| 39 | **Follow the trace** | distributed tracing: spans across lb→api→db, latency attribution, connection pooler fix, db-latency alerting | ✅ |
+| 40 | **The acquisition** | capstone: five-pillar due diligence (security, reliability, FinOps, team, portfolio), term sheet, announcement scale event, legend mode | ✅ |
 
 ## 11. First Playable Vertical Slice (scope of this delivery)
 
@@ -294,6 +302,7 @@ mission-chain integration test.
   with a gated enterprise tier (m27), and FinOps tooling: budgets with a daily
   scoreboard, unit economics, utilization-based rightsizing recommendations
   and reserved-compute commitments (m28).
+- **P5 (shipped):** trust & scale — security & compliance arc (P5a): a vault sim with generated secrets, dynamic DB credentials and zero-downtime rotation (m33); zero trust via a service mesh with STRICT mTLS, NetworkPolicies and runAsNonRoot (m34); a supply chain with cosign signing/SBOM and a cluster admission policy that physically blocks unsigned images (m35); and a compliance layer with live findings, access review, append-only audit storage and evidence bundles (m36). Platform-engineering endgame (P5b): an internal developer portal with golden paths and a self-service deploy feed (m37); ephemeral per-run preview environments (m38); distributed tracing with latency attribution, a pgbouncer fix and db-latency alerting (m39); and the acquisition capstone — five due-diligence pillars over real world state, a term sheet, an announcement scale event and endless legend mode (m40).
 - **P4 (shipped):** modes & content at scale — challenge mode (m31): three
   graded constraint runs (an 18% austerity budget cap, a 99.5% windowed
   availability audit with pop quizzes, an unannounced database drop with an

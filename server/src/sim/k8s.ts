@@ -64,6 +64,25 @@ export function imageKnown(world: World, image: string): boolean {
     || world.docker.images.some((i) => i.repoTags.includes(image));
 }
 
+/** Is the image signed (supply chain, P5a)? Registry copy wins. */
+export function imageSigned(world: World, image: string): boolean {
+  const reg = world.registry.find((i) => i.repoTags.includes(image));
+  if (reg) return Boolean(reg.signed);
+  const local = world.docker.images.find((i) => i.repoTags.includes(image));
+  return Boolean(local?.signed);
+}
+
+/** Admission check used by every path that puts a new image on the cluster. */
+function admissionAllows(world: World, image: string): { ok: boolean; reason?: string } {
+  const k = world.k8s;
+  if (k?.admissionPolicy?.rule === 'signed-images' && !imageSigned(world, image)) {
+    world.flags.admissionBlocked = true;
+    world.audit.push({ t: world.nowMin, actor: 'admission', kind: 'security', text: `ADMISSION DENIED: ${image} is not signed — the require-signed-images policy blocked the rollout` });
+    return { ok: false, reason: `admission webhook "require-signed-images" denied the request: image ${image} is not signed (cosign sign it first)` };
+  }
+  return { ok: true };
+}
+
 // ------------------------------------------------------------------
 // Manifest parsing
 // ------------------------------------------------------------------
@@ -160,6 +179,9 @@ function applyOne(world: World, m: ParsedManifest): OutLine[] {
       if (!image) throw new Error('container is missing "image:"');
       const ports = Array.isArray(c.ports) ? c.ports as Record<string, unknown>[] : [];
       const containerPort = Number(ports[0]?.containerPort ?? 8080);
+      // securityContext.runAsNonRoot (P5a least privilege)
+      const secCtx = (c.securityContext ?? {}) as Record<string, unknown>;
+      const runAsNonRoot = secCtx.runAsNonRoot === true || secCtx.runAsNonRoot === 'true';
       const strategy = ((spec.strategy as Record<string, unknown>)?.type ?? 'RollingUpdate') === 'Recreate' ? 'Recreate' : 'RollingUpdate';
       const replicas = Number(spec.replicas ?? 1);
       const env = readEnvFromDotEnv(world);
@@ -167,7 +189,10 @@ function applyOne(world: World, m: ParsedManifest): OutLine[] {
       for (const e of manifestEnv) if (e.name && e.value !== undefined) env[String(e.name)] = String(e.value);
 
       const existing = k.deployments[m.name];
+      // admission control (P5a): the cluster refuses unsigned images once the policy is on
       if (existing && existing.image !== image) {
+        const admit = admissionAllows(world, image);
+        if (!admit.ok) throw new Error(admit.reason!);
         // rolling update: new revision; old pods retire as the new ones go Ready
         existing.history.push({ revision: existing.revision, image: existing.image, atMin: world.nowMin });
         existing.revision += 1;
@@ -177,6 +202,7 @@ function applyOne(world: World, m: ParsedManifest): OutLine[] {
         existing.containerPort = containerPort;
         existing.readinessProbe = Boolean(c.readinessProbe);
         existing.livenessProbe = Boolean(c.livenessProbe);
+        existing.runAsNonRoot = runAsNonRoot;
         existing.env = env;
         if (strategy === 'Recreate') {
           for (const p of podsFor(world, m.name)) p.phase = 'Terminating';
@@ -187,6 +213,7 @@ function applyOne(world: World, m: ParsedManifest): OutLine[] {
       }
       if (existing) {
         existing.replicas = replicas;
+        existing.runAsNonRoot = runAsNonRoot || Boolean(existing.runAsNonRoot);
         spawnMissingPods(world, m.name);
         return [{ text: `deployment.apps/${m.name} configured`, cls: 'ok' }];
       }
@@ -200,6 +227,7 @@ function applyOne(world: World, m: ParsedManifest): OutLine[] {
         containerPort,
         readinessProbe: Boolean(c.readinessProbe),
         livenessProbe: Boolean(c.livenessProbe),
+        runAsNonRoot,
         env,
         history: [],
         createdAtMin: world.nowMin
@@ -248,8 +276,41 @@ function applyOne(world: World, m: ParsedManifest): OutLine[] {
       world.audit.push({ t: world.nowMin, actor: world.session.user, kind: 'k8s', text: `HPA ${m.name}: ${deployment} ${hpa.minReplicas}..${hpa.maxReplicas} replicas (target CPU ${hpa.targetCpuPct}%)` });
       return [{ text: `horizontalpodautoscaler.autoscaling/${m.name} created`, cls: 'ok' }];
     }
+    case 'NetworkPolicy': {
+      // P5a zero trust: a default-deny policy selects every pod and allows
+      // nothing; an allow policy permits explicit (selector, port) pairs.
+      if (!k.networkPolicies) k.networkPolicies = {};
+      const podSelector = (spec.podSelector ?? {}) as Record<string, unknown>;
+      const matchLabels = (podSelector.matchLabels ?? {}) as Record<string, unknown>;
+      const selectorKeys = Object.keys(matchLabels);
+      const ingressRules = Array.isArray(spec.ingress) ? spec.ingress as Record<string, unknown>[] : [];
+      const allows: { fromSelector: string; port: number }[] = [];
+      for (const rule of ingressRules) {
+        const from = Array.isArray(rule.from) ? rule.from as Record<string, unknown>[] : [];
+        const ports = Array.isArray(rule.ports) ? rule.ports as Record<string, unknown>[] : [];
+        for (const f of from) {
+          const fSel = ((f.podSelector ?? {}) as Record<string, unknown>).matchLabels as Record<string, unknown> | undefined;
+          const fromSel = fSel ? Object.entries(fSel).map(([kk, vv]) => `${kk}=${vv}`).join(',') : '*';
+          const port = ports.length ? Number((ports[0].port as number | undefined) ?? 80) : 0;
+          allows.push({ fromSelector: fromSel, port });
+        }
+      }
+      const defaultDeny = selectorKeys.length === 0 && allows.length === 0;
+      k.networkPolicies[m.name] = { name: m.name, defaultDeny, allows };
+      world.audit.push({ t: world.nowMin, actor: world.session.user, kind: 'k8s', text: `NetworkPolicy ${m.name}: ${defaultDeny ? 'default-deny (all ingress blocked unless explicitly allowed)' : allows.map((a) => `allow ${a.fromSelector} → :${a.port}`).join(', ')}` });
+      return [{ text: `networkpolicy.networking.k8s.io/${m.name} created`, cls: 'ok' }];
+    }
+    case 'Policy': {
+      // P5a admission control: require signed images cluster-wide.
+      const requireSigned = spec.requireSignedImages === true || spec.requireSignedImages === 'true'
+        || /signed/i.test(JSON.stringify(spec));
+      if (!requireSigned) throw new Error('policy must set spec.requireSignedImages: true');
+      k.admissionPolicy = { rule: 'signed-images', name: m.name, appliedAtMin: world.nowMin };
+      world.audit.push({ t: world.nowMin, actor: world.session.user, kind: 'security', text: `Admission policy applied: ${m.name} — unsigned images can no longer be deployed to the cluster` });
+      return [{ text: `policy.shipit.dev/${m.name} created (admission: require-signed-images)`, cls: 'ok' }];
+    }
     default:
-      throw new Error(`cannot handle object kind ${m.kind} (supported: Deployment, Service, Ingress, HorizontalPodAutoscaler)`);
+      throw new Error(`cannot handle object kind ${m.kind} (supported: Deployment, Service, Ingress, HorizontalPodAutoscaler, NetworkPolicy, Policy)`);
   }
 }
 
@@ -379,7 +440,7 @@ export function kubectlCmd(world: World, argv: string[]): KubectlResult {
         lines: [
           { text: 'kubectl — control the cluster (simulated)', cls: 'hdr' },
           { text: 'apply -f <file|dir>     create/update resources from YAML' },
-          { text: 'get pods|deploy|svc|ingress|hpa|nodes' },
+          { text: 'get pods|deploy|svc|ingress|hpa|netpol|policy|nodes' },
           { text: 'describe pod <name> | deployment <name>' },
           { text: 'scale deployment/<name> --replicas=N' },
           { text: 'autoscale deployment/<name> --min=N --max=N --cpu-percent=P' },
@@ -445,6 +506,8 @@ export function kubectlCmd(world: World, argv: string[]): KubectlResult {
       if (!dep) return e(`Error from server (NotFound): deployments.apps "${m[1]}" not found`);
       const pair = /^(\S+)=(\S+)$/.exec(argv[4] ?? '');
       if (!pair) return e('expected CONTAINER=IMAGE');
+      const admit = admissionAllows(world, pair[2]);
+      if (!admit.ok) return e(`Error from server (Forbidden): ${admit.reason}`);
       dep.history.push({ revision: dep.revision, image: dep.image, atMin: world.nowMin });
       dep.revision += 1;
       dep.image = pair[2];
@@ -585,6 +648,20 @@ function getTable(world: World, what: string): OutLine[] {
     for (const n of k.nodes) lines.push({ text: `${n.padEnd(17)} Ready    control-plane,worker   ${age(world.createdAtMin)}   v1.29.4` });
     return lines;
   }
+  if (what === 'netpol' || what === 'networkpolicies' || what === 'networkpolicy') {
+    const lines: OutLine[] = [{ text: 'NAME             POD-SELECTOR   RULES', cls: 'hdr' }];
+    for (const p of Object.values(k.networkPolicies ?? {})) {
+      lines.push({ text: `${p.name.padEnd(17)} ${p.defaultDeny ? '<none>' : '<target>'}       ${p.defaultDeny ? 'deny-all ingress' : p.allows.map((a) => `allow ${a.fromSelector || '*'} :${a.port}`).join(', ')}` });
+    }
+    if (!Object.keys(k.networkPolicies ?? {}).length) lines.push({ text: 'No resources found in default namespace.', cls: 'dim' });
+    return lines;
+  }
+  if (what === 'policy' || what === 'policies') {
+    const lines: OutLine[] = [{ text: 'NAME                    RULE', cls: 'hdr' }];
+    if (k.admissionPolicy) lines.push({ text: `${k.admissionPolicy.name.padEnd(24)} require-signed-images` });
+    else lines.push({ text: 'No admission policies found in default namespace.', cls: 'dim' });
+    return lines;
+  }
   if (what === 'all') {
     return [...getTable(world, 'deployments'), ...getTable(world, 'pods'), ...getTable(world, 'services')];
   }
@@ -617,6 +694,7 @@ function describe(world: World, kind: string, name?: string): OutLine[] | null {
       { text: `Replicas:   ${dep.readyReplicas}/${dep.replicas} ready` },
       { text: `Strategy:   ${dep.strategy}` },
       { text: `Probes:     readiness=${dep.readinessProbe ? 'yes' : 'NO'} liveness=${dep.livenessProbe ? 'yes' : 'NO'}` },
+      { text: `Security:   runAsNonRoot=${dep.runAsNonRoot ? 'yes' : 'NO'}` },
       { text: `Revision:   ${dep.revision} (history: ${dep.history.length})` }
     ];
   }

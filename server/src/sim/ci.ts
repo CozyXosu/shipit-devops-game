@@ -86,6 +86,33 @@ export function startCanary(world: World, image: string): void {
   world.audit.push({ t: world.nowMin, actor: 'ci', kind: 'deploy', text: `Canary live: ${image} at 10% of traffic — watching error rate for 30 sim minutes` });
 }
 
+/** Spin up an ephemeral preview environment for this run (P5b, m38). */
+export function spawnPreview(world: World, run: CiRun, image: string): { ok: boolean; message: string } {
+  if (!image) return { ok: false, message: 'no image to preview: build/push must run first' };
+  const n = Number(world.flags.previewCounter ?? 0) + 1;
+  world.flags.previewCounter = n;
+  const id = `pr-${n}`;
+  if (!world.ci.previews) world.ci.previews = [];
+  const preview = {
+    id,
+    runId: run.id,
+    image,
+    url: `${id}.preview.${world.company.slug}.dev`,
+    createdAtMin: world.nowMin,
+    expiresAtMin: world.nowMin + 120
+  };
+  world.ci.previews.push(preview);
+  if (world.ci.previews.length > 12) world.ci.previews.splice(0, world.ci.previews.length - 10);
+  world.flags.previewConfigured = true;
+  world.audit.push({ t: world.nowMin, actor: 'ci', kind: 'deploy', text: `Preview environment up: ${preview.url} (${image}) — auto-destroys in 120 sim minutes` });
+  return { ok: true, message: `preview ${id} live at ${preview.url}` };
+}
+
+/** Is a pipeline a preview-enabled pipeline (has a preview step)? */
+export function hasPreviewStep(p: Pipeline): boolean {
+  return p.steps.some((s) => /preview/i.test(s.name) || (s.uses ?? '').includes('preview') || /preview\s+(up|deploy)/.test(s.run ?? ''));
+}
+
 /** Approve or reject a run that is waiting on the production approval gate. */
 export function approveRun(world: World, runId: string, approve: boolean): { ok: boolean; message: string } {
   const run = world.ci.runs.find((r) => r.id === runId);
@@ -143,6 +170,9 @@ function processSteps(world: World, run: CiRun, steps: PipelineStep[], ctx: Step
     const isStagingDeploy = (/staging/i.test(step.name) || /staging/i.test(step.run ?? '') || (step.uses ?? '').includes('deploy-staging')) && /deploy/i.test(step.name + (step.uses ?? '') + (step.run ?? ''));
     const isE2e = /e2e|end-to-end|end.to.end/i.test(step.name) || /e2e|end-to-end/.test(step.run ?? '');
     const isApproval = (step.uses ?? '').includes('approval');
+    const isPreview = /preview/i.test(step.name) || (step.uses ?? '').includes('preview') || /preview\s+(up|deploy)/.test(step.run ?? '');
+    const isSign = /^cosign\s+sign/.test(step.run ?? '') || (/sign/.test(step.name) && /cosign/.test(step.run ?? ''));
+    const isSbom = /cosign\s+attest/.test(step.run ?? '') || (/sbom/i.test(step.name) && /cosign|attest/.test(step.run ?? ''));
 
     if ((step.uses ?? '').includes('checkout')) {
       log.push(`HEAD is now at ${headSha.slice(0, 7)}`);
@@ -165,6 +195,31 @@ function processSteps(world: World, run: CiRun, steps: PipelineStep[], ctx: Step
       log.push(`Deploying ${image} to staging (staging.acme.internal)…`);
       log.push('Staging container healthy after 4.1s');
       world.audit.push({ t: world.nowMin, actor: 'ci', kind: 'ci', text: `Deployed ${image} to STAGING` });
+    } else if (isPreview) {
+      // ephemeral preview environment per run (P5b, m38)
+      const image = pushedTag ?? lastBuiltTag;
+      if (!image) { log.push('no image to preview: build/push must run first'); stage.status = 'failed'; failRemaining(stepIdx); break; }
+      const r = spawnPreview(world, run, image);
+      log.push(r.message);
+      log.push(`Preview URL: ${world.ci.previews?.at(-1)?.url} (destroys itself in 120 sim minutes)`);
+    } else if (isSign) {
+      // supply chain (P5a, m35): sign what this pipeline just pushed
+      const tag = pushedTag ?? lastBuiltTag;
+      if (!tag) { log.push('no image to sign: build/push must run first'); stage.status = 'failed'; failRemaining(stepIdx); break; }
+      const img = world.registry.find((i) => i.repoTags.includes(tag)) ?? world.docker.images.find((i) => i.repoTags.includes(tag));
+      if (!img) { log.push(`image ${tag} not found`); stage.status = 'failed'; failRemaining(stepIdx); break; }
+      img.signed = true;
+      log.push(`Signing [${tag}] — keyless, transparency log entry created`);
+      world.audit.push({ t: world.nowMin, actor: 'ci', kind: 'security', text: `CI signed image ${tag} (cosign, keyless)` });
+    } else if (isSbom) {
+      const tag = pushedTag ?? lastBuiltTag;
+      if (!tag) { log.push('no image to attest: build/push must run first'); stage.status = 'failed'; failRemaining(stepIdx); break; }
+      const img = world.registry.find((i) => i.repoTags.includes(tag)) ?? world.docker.images.find((i) => i.repoTags.includes(tag));
+      if (!img) { log.push(`image ${tag} not found`); stage.status = 'failed'; failRemaining(stepIdx); break; }
+      if (!img.signed) { log.push(`${tag} is not signed — attest requires a signature first`); stage.status = 'failed'; failRemaining(stepIdx); break; }
+      img.sbom = true;
+      log.push(`SBOM attestation attached to ${tag} (SPDX, 148 packages)`);
+      world.audit.push({ t: world.nowMin, actor: 'ci', kind: 'security', text: `CI attached SBOM attestation to ${tag}` });
     } else if (isE2e) {
       const staging = world.ci.staging;
       if (!staging?.image) { log.push('e2e needs a staging deploy step first'); stage.status = 'failed'; failRemaining(stepIdx); break; }

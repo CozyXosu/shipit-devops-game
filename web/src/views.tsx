@@ -495,6 +495,13 @@ export function DbView({ game, view, refresh }: { game: string; view: GameView; 
             <button className="primary" onClick={migrate}>RUN MIGRATIONS</button>
           </div>
         )}
+        {view.db.provisioned && !view.db.pooler && (
+          <div className="row" style={{ gap: 8, marginTop: 10 }}>
+            <button onClick={async () => { await api.dbPooler(game); refresh(); }}>ENABLE PGBOUNCER ($12/mo)</button>
+            <span className="dimtxt">connection pooler in front of Postgres — kills connection-churn latency</span>
+          </div>
+        )}
+        {view.db.pooler && <div style={{ marginTop: 8 }}><span className="pill ok">pgbouncer active</span></div>}
         {migLines.length > 0 && <div className="logview" style={{ marginTop: 10 }}>{migLines.map((l, i) => <div key={i} className={l.cls}>{l.text}</div>)}</div>}
         {view.db.tables.length > 0 && (
           <table className="list" style={{ marginTop: 12 }}>
@@ -659,6 +666,7 @@ export function Monitoring({ game, view, refresh }: { game: string; view: GameVi
             <option value="disk_pct">disk_pct</option>
             <option value="db_cpu_pct">db_cpu_pct</option>
             <option value="p95_ms">p95_ms</option>
+            <option value="db_p95_ms">db_p95_ms</option>
           </select>
           <span>&gt;</span>
           <input value={threshold} onChange={(e) => setThreshold(e.target.value)} style={{ width: 80 }} />
@@ -680,6 +688,67 @@ export function Monitoring({ game, view, refresh }: { game: string; view: GameVi
         {view.alerts.length === 0 ? <div className="dimtxt" style={{ marginTop: 6 }}>No rules — you are flying blind.</div> : null}
         <div className="dimtxt" style={{ marginTop: 8 }}>Latest: error {(m.error_pct ?? 0).toFixed(1)}% · cpu {(m.cpu_pct ?? 0).toFixed(0)}% · disk {(m.disk_pct ?? 0).toFixed(0)}%</div>
       </div>
+
+      <TracingPanel game={game} view={view} refresh={refresh} />
+    </div>
+  );
+}
+
+/** Distributed tracing (P5b, m39): sampled spans + latency attribution. */
+function TracingPanel({ game, view, refresh }: { game: string; view: GameView; refresh: Refresh }) {
+  const t = view.tracing;
+  const [note, setNote] = useState('');
+
+  const analyze = async () => {
+    const r = await api.tracingAnalyze(game);
+    setNote(r.ok
+      ? r.attribution.map((a) => `${a.service}: ${a.sharePct}% (avg ${a.avgMs}ms/span)`).join(' · ')
+      : r.message);
+    refresh();
+  };
+
+  return (
+    <div className="panel">
+      <h2>Tracing <span className="hintInline">follow one request across lb → api → db</span></h2>
+      {!t.enabled ? (
+        <div className="row" style={{ gap: 8 }}>
+          <button className="primary" onClick={async () => { const r = await api.tracingEnable(game); setNote(r.message); refresh(); }}>ENABLE TRACING</button>
+          <span className="dimtxt">samples one request every 5 sim minutes, one span per hop</span>
+        </div>
+      ) : (
+        <div>
+          <div className="row" style={{ gap: 10 }}>
+            <span className="pill ok">tracing live · {t.traces.length} recent trace(s)</span>
+            <span className="dimtxt">db span p95: {Math.round(t.dbP95)}ms</span>
+            {t.bottleneckFound ? <span className="pill warn">bottleneck identified: the database</span> : null}
+            <button onClick={analyze} disabled={t.traces.length < 5}>ANALYZE</button>
+          </div>
+          {note ? <div className="dimtxt" style={{ marginTop: 8 }}>{note}</div> : null}
+          <table className="list" style={{ marginTop: 10 }}>
+            <thead><tr><th>trace</th><th>spans (share of duration)</th><th>total</th></tr></thead>
+            <tbody>
+              {t.traces.map((tr) => (
+                <tr key={tr.id}>
+                  <td className="dimtxt">{tr.id}</td>
+                  <td>
+                    <div style={{ display: 'flex', gap: 2, height: 14, borderRadius: 4, overflow: 'hidden', minWidth: 260 }}>
+                      {tr.spans.map((sp) => (
+                        <div key={sp.service} title={`${sp.service} ${sp.operation} ${sp.durationMs}ms`}
+                          style={{ width: `${(sp.durationMs / tr.durationMs) * 100}%`, background: sp.service === 'db' ? '#bc8cff' : sp.service === 'api' ? '#58a6ff' : '#3fb970' }} />
+                      ))}
+                    </div>
+                    <div className="dimtxt" style={{ fontSize: 10, marginTop: 2 }}>
+                      {tr.spans.map((sp) => `${sp.service} ${sp.durationMs}ms`).join(' · ')}
+                    </div>
+                  </td>
+                  <td>{tr.durationMs}ms</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {t.traces.length === 0 ? <div className="dimtxt">Sampling — traces appear every 5 sim minutes.</div> : null}
+        </div>
+      )}
     </div>
   );
 }
@@ -927,6 +996,26 @@ export function Cloud({ game, view, refresh }: { game: string; view: GameView; r
             <div className="row" style={{ gap: 8 }}>
               <button className="primary" onClick={async () => { const r = await api.cloudK8s(game); say(r.message); }}>PROVISION CLUSTER ($220/mo)</button>
               <span className="dimtxt">managed control plane, 3 worker nodes — Deployments, rollouts, HPA</span>
+            </div>
+          )}
+        </div>
+
+        <div className="panel">
+          <h2>Service mesh <span className="hintInline">zero trust: identities + mTLS</span></h2>
+          {view.zeroTrust?.meshInstalled ? (
+            <div className="row" style={{ gap: 12 }}>
+              <span className="pill ok">mesh installed</span>
+              <span className="dimtxt">identities: {view.zeroTrust.identities.join(', ')}</span>
+              {view.zeroTrust.mtlsStrict ? (
+                <span className="pill ok">mTLS STRICT — plaintext refused</span>
+              ) : (
+                <button onClick={async () => { const r = await api.cloudMesh(game, 'strict'); say(r.message); }}>ENFORCE STRICT mTLS</button>
+              )}
+            </div>
+          ) : (
+            <div className="row" style={{ gap: 8 }}>
+              <button className="primary" onClick={async () => { const r = await api.cloudMesh(game, 'install'); say(r.message); }}>INSTALL MESH ($60/mo)</button>
+              <span className="dimtxt">every service gets a cryptographic identity; mTLS starts permissive</span>
             </div>
           )}
         </div>
@@ -1372,6 +1461,9 @@ export function Company({ game, view, refresh }: { game: string; view: GameView;
           </div>
         </div>
       </div>
+
+      <CompliancePanel game={game} view={view} say={say} />
+      <AcquisitionPanel game={game} view={view} say={say} />
     </div>
   );
 }
@@ -1557,6 +1649,177 @@ export function Modes({ game, view, refresh, t, locale, onLocale, a11y, onA11y }
         <div className="dimtxt" style={{ marginTop: 8, fontSize: 12 }}>{t('modes.access.note')}</div>
         {!unlocked && <div className="dimtxt" style={{ marginTop: 6, fontSize: 12 }}>{t('modes.gated')}</div>}
       </div>
+    </div>
+  );
+}
+
+// =====================================================================
+// COMPLIANCE (P5a, m36)
+// =====================================================================
+function CompliancePanel({ game, view, say }: { game: string; view: GameView; say: (m: string) => void }) {
+  const c = view.compliance;
+  return (
+    <div className="panel">
+      <h2>Compliance &amp; audit <span className="hintInline">the auditor cometh — findings are live, remediation is real</span></h2>
+      <div className="row" style={{ gap: 12, flexWrap: 'wrap' }}>
+        <span className={`pill ${c.findings.length === 0 ? 'ok' : 'err'}`}>{c.findings.length === 0 ? 'zero open findings' : `${c.findings.length} open finding(s)`}</span>
+        <span className={`pill ${c.auditImmutable ? 'ok' : 'warn'}`}>{c.auditImmutable ? 'audit log append-only (WORM)' : 'audit log local & mutable'}</span>
+        <span className="dimtxt">evidence bundles collected: {c.bundlesCount}</span>
+      </div>
+
+      <div style={{ marginTop: 12 }}>
+        <b style={{ fontSize: 13 }}>Access review (web-01)</b>
+        <table className="list" style={{ marginTop: 6 }}>
+          <thead><tr><th>user</th><th>groups</th><th>sudo</th><th></th></tr></thead>
+          <tbody>
+            {c.users.map((u) => (
+              <tr key={u.name}>
+                <td><b>{u.name}</b></td>
+                <td className="dimtxt">{u.groups.join(', ') || '—'}</td>
+                <td>{u.sudo ? <span className="pill warn">sudo</span> : <span className="pill ok">none</span>}</td>
+                <td>{u.sudo && u.name !== 'dev' && u.name !== 'root' ? <button onClick={async () => { const r = await api.complianceAccess(game, u.name); say(r.message); }}>REVOKE SUDO</button> : null}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="row" style={{ gap: 10, marginTop: 12 }}>
+        {!c.auditImmutable && (
+          <button className="primary" onClick={async () => { const r = await api.complianceAuditlog(game); say(r.message); }}>ENABLE APPEND-ONLY AUDIT STORE</button>
+        )}
+        <button onClick={async () => { const r = await api.complianceEvidence(game); say(r.message); }}>COLLECT EVIDENCE BUNDLE</button>
+      </div>
+
+      {c.findings.length > 0 ? (
+        <div style={{ marginTop: 12 }}>
+          <b style={{ fontSize: 13 }}>Findings</b>
+          {c.findings.map((f) => (
+            <div key={f.id} style={{ padding: '6px 0', borderBottom: '1px solid #202938' }}>
+              <span className={`pill ${f.severity === 'high' ? 'err' : f.severity === 'medium' ? 'warn' : 'ok'}`}>{f.severity}</span>{' '}
+              <b>{f.label}</b> <span className="dimtxt">— {f.detail}</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="dimtxt" style={{ marginTop: 12 }}>No open findings. The data room is boring — exactly how auditors like it.</div>
+      )}
+
+      {c.lastBundle && (
+        <div style={{ marginTop: 12 }}>
+          <b style={{ fontSize: 13 }}>Last evidence bundle (day {Math.floor(c.lastBundle.atMin / 1440) + 1})</b>
+          {c.lastBundle.checks.map((k) => (
+            <div key={k.id} className="dimtxt" style={{ padding: '2px 0' }}>
+              {k.ok ? '✓' : '✗'} {k.label}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// =====================================================================
+// ACQUISITION ENDGAME (P5b, m40)
+// =====================================================================
+function AcquisitionPanel({ game, view, say }: { game: string; view: GameView; say: (m: string) => void }) {
+  const e = view.endgame;
+  const allGreen = e.pillars.every((p) => p.pass);
+  return (
+    <div className="panel">
+      <h2>Acquisition <span className="hintInline">due diligence over everything you built</span></h2>
+      {e.legendMode ? (
+        <div className="dimtxt">
+          <b>ACQUIRED — legend mode.</b> The world keeps happening: sandbox, challenges and packs are yours.
+        </div>
+      ) : (
+        <div>
+          <table className="list">
+            <thead><tr><th>pillar</th><th>status</th><th>what it checks</th></tr></thead>
+            <tbody>
+              {e.pillars.map((p) => (
+                <tr key={p.id}>
+                  <td><b>{p.label}</b></td>
+                  <td><span className={`pill ${p.pass ? 'ok' : 'err'}`}>{p.pass ? 'PASS' : 'RED'}</span></td>
+                  <td className="dimtxt">{p.detail}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="row" style={{ gap: 10, marginTop: 12 }}>
+            {e.termSheetAccepted ? (
+              <>
+                <span className="pill ok">TERM SHEET ACCEPTED — payout ${(e.payout ?? 0).toLocaleString()}</span>
+                <span className={`pill ${e.scaleEventSurvived ? 'ok' : 'warn'}`}>
+                  {e.scaleEventSurvived ? 'announcement traffic survived ✓' : 'announcement traffic incoming — hold the line'}
+                </span>
+              </>
+            ) : (
+              <button className="primary" disabled={!allGreen} title={allGreen ? '' : 'fix the red pillars first'} onClick={async () => { const r = await api.endgameAccept(game); say(r.message); }}>
+                ACCEPT TERM SHEET
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// =====================================================================
+// DEVELOPER PORTAL (P5b, m37)
+// =====================================================================
+export function Portal({ game, view, refresh }: { game: string; view: GameView; refresh: Refresh }) {
+  const p = view.portal;
+  const [msg, setMsg] = useState('');
+  const say = (m: string) => { setMsg(m); refresh(); };
+  if (!p) return <div className="panel"><h2>Developer portal</h2><div className="dimtxt">Unlocks with the platform phase (mission 37).</div></div>;
+  return (
+    <div>
+      {msg && <div className="panel" style={{ borderColor: 'var(--green)' }}><span style={{ color: 'var(--green)' }}>✓ {msg}</span></div>}
+
+      <div className="panel">
+        <h2>Internal developer portal <span className="hintInline">golden paths: self-service with inherited guardrails</span></h2>
+        {!p.enabled ? (
+          <div className="row" style={{ gap: 8 }}>
+            <button className="primary" onClick={async () => { const r = await api.portalEnable(game); say(r.message); }}>LAUNCH PORTAL</button>
+            <span className="dimtxt">wraps your pipeline: tests, scans, signing, deploy — one paved road</span>
+          </div>
+        ) : (
+          <div className="row" style={{ gap: 14, flexWrap: 'wrap' }}>
+            <span className="pill ok">portal live</span>
+            <span className="dimtxt">dev self-service deploys: <b>{p.devDeploys}</b></span>
+            <span className={`pill ${p.ticketQueue === 0 ? 'ok' : 'warn'}`}>deploy-ticket queue: {p.ticketQueue}</span>
+          </div>
+        )}
+      </div>
+
+      <div className="panel">
+        <h2>Golden paths</h2>
+        {p.templates.map((t) => (
+          <div key={t.id} style={{ padding: '8px 0', borderBottom: '1px solid #202938' }}>
+            <div className="row" style={{ justifyContent: 'space-between' }}>
+              <span>
+                <b>{t.name}</b> <span className="dimtxt">— {t.description}</span>
+              </span>
+              {t.published
+                ? <span className="pill ok">published — self-service</span>
+                : <button className="primary" disabled={!p.enabled} onClick={async () => { const r = await api.portalPublish(game, t.id); say(r.message); }}>PUBLISH</button>}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {p.deployLog.length > 0 && (
+        <div className="panel">
+          <h2>Developer activity <span className="hintInline">shipping without you</span></h2>
+          {p.deployLog.map((d, i) => (
+            <div key={i} className="dimtxt" style={{ padding: '3px 0' }}>
+              d{Math.floor(d.atMin / 1440) + 1} — <b>{d.dev}</b> shipped <b>{d.service}</b> via the golden path
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, GameSummary, GameView } from './lib/api';
 import { isLocale, Locale, makeT } from './lib/i18n';
-import { Terminal, Editor, Dashboard, CiView, DbView, Monitoring, Cloud, Costs, Postmortems, K8sView, Company, Modes } from './views';
+import { Terminal, Editor, Dashboard, CiView, DbView, Monitoring, Cloud, Costs, Postmortems, K8sView, Company, Modes, Portal } from './views';
 
 const TABS = [
   { id: 'missions' }, { id: 'terminal' }, { id: 'editor' }, { id: 'dashboard' }, { id: 'ci' }, { id: 'k8s' },
-  { id: 'database' }, { id: 'monitoring' }, { id: 'cloud' }, { id: 'company' }, { id: 'costs' }, { id: 'incidents' }, { id: 'modes' }
+  { id: 'database' }, { id: 'monitoring' }, { id: 'cloud' }, { id: 'company' }, { id: 'costs' }, { id: 'incidents' }, { id: 'portal' }, { id: 'modes' }
 ] as const;
 
 export interface A11ySettings { highContrast: boolean; largeText: boolean; reducedMotion: boolean }
@@ -248,6 +248,7 @@ function GameShell({ gameId, view, setView, onExit, t, locale, setLocale, a11y, 
           {tab === 'company' && <Company game={gameId} view={view} refresh={refresh} />}
           {tab === 'costs' && <Costs game={gameId} view={view} refresh={refresh} />}
           {tab === 'incidents' && <Postmortems game={gameId} view={view} refresh={refresh} />}
+          {tab === 'portal' && <Portal game={gameId} view={view} refresh={refresh} />}
           {tab === 'modes' && (
             <Modes
               game={gameId}

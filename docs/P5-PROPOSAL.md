@@ -1,8 +1,10 @@
-# P5 Proposal — Trust & Scale (DRAFT — not yet approved)
+# P5 Proposal — Trust & Scale (ACCEPTED & IMPLEMENTED)
 
-Status: **PROPOSAL**. Nothing here is committed design. On approval, fold into
-`docs/DESIGN.md` §10/§12 and implement sub-phase by sub-phase. Do not implement
-from this file without explicit user sign-off (proposed 2026-09-28).
+Status: **SHIPPED 2026-09-28** (both sub-phases, m33–m40). The curriculum rows
+live in `docs/DESIGN.md` §10 and the roadmap entry in §12; this file stays as
+the decision record. Open questions were resolved as: both sub-phases approved;
+m40 endgame flavor = acquisition; the security arc gates the endgame through
+the due-diligence data room (mirroring how the enterprise tier gates on m27).
 
 Pitch: P0–P4 taught running a platform. P5 teaches **earning trust in it**
 (security & compliance) and **scaling past the founding team** (platform

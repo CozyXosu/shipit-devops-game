@@ -1,13 +1,13 @@
 // World: creation (seed state), the tick engine (simulated time), incidents,
 // economy, cloud-console actions, and audit. This module is the "game engine"
 // the REST API drives.
-import { World, GameState, Incident, AlertRule, MetricPoint, OutLine, Engineer, EngineerRole, RefactorProject, TeamState, DebtState, SloState, CloudState, Product, ProductState, FinOpsState, CostLineItem, ChallengeRunState, TournamentState } from './types';
+import { World, GameState, Incident, AlertRule, MetricPoint, OutLine, Engineer, EngineerRole, RefactorProject, TeamState, DebtState, SloState, CloudState, Product, ProductState, FinOpsState, CostLineItem, ChallengeRunState, TournamentState, ZeroTrustState, ComplianceState, ComplianceFinding, EvidenceBundle, PortalState, Trace, EndgameState, DueDiligencePillar } from './types';
 import { makeHost, addProcess } from './sim/host';
 import * as fs from './sim/fs';
 import { updateDbCpu, seedTables } from './sim/dbsim';
 import { lbBackends, hostServesApi } from './sim/net';
 import { hashStr } from './sim/docker';
-import { tickK8s, provisionCluster, resizeNodePool, k8sServes } from './sim/k8s';
+import { tickK8s, provisionCluster, resizeNodePool, k8sServes, imageSigned } from './sim/k8s';
 import { deployImage } from './sim/ci';
 import { PROVIDERS, providerOf, regionOf, isRegion, costMultiplierOf, latencyMsOf, BASE_LATENCY_MS, plannedDowntimeMin, slaCreditFor, migrationCostOf, MIGRATION_DURATION_MIN } from './sim/cloud';
 import { CHALLENGES, challengeOf, budgetCapOf, windowedAvailability } from './sim/challenges';
@@ -490,6 +490,27 @@ function tickOne(world: World): void {
     if (e.kind === 'tournament_incident') {
       openIncidentOfKind(world, String(e.payload?.kind ?? 'traffic_spike'));
     }
+    if (e.kind === 'secret_leak') {
+      // P5a (m33): a stray backup file appears with the live secret inside
+      const v = world.vault;
+      const s = v?.secrets['database/api'];
+      if (s) {
+        fs.writeFile(world.hosts['web-01'].fs, '/opt/app/notes-old.txt', `# old migration notes (do not delete)\n# db password at time of writing: ${s.value}\nnote to self: rotate this someday\n`, 'dev');
+        world.flags.vaultLeakPlanted = true;
+        audit(world, 'intern', 'security', 'A stray file /opt/app/notes-old.txt appeared — an old migration note. It looks like it contains a password.');
+      }
+    }
+    if (e.kind === 'exit_scale_check') {
+      // P5b (m40): did the platform hold through the announcement traffic?
+      const open = world.monitoring.incidents.some((i) => i.status === 'open');
+      if (!open && (latest(world, 'error_pct') ?? 99) < 2) {
+        world.flags.scaleEventSurvived = true;
+        audit(world, 'system', 'game', 'SCALE EVENT SURVIVED: the announcement traffic hit, the platform absorbed it, and the acquirers watched it happen. That is the whole game.');
+      } else {
+        audit(world, 'system', 'chaos', 'Scale event strained the platform — stabilize it (open incident / error rate) and the check re-runs in 30 sim minutes.');
+        world.scheduledEvents.push({ atMin: world.nowMin + 30, kind: 'exit_scale_check' });
+      }
+    }
     if (e.kind === 'challenge_disaster') {
       const run = world.challenge;
       if (run?.status === 'active' && run.disasterAtMin !== undefined) {
@@ -528,6 +549,9 @@ function tickOne(world: World): void {
   tickFinops(world); // recommendation resolution + budget tracking (P3)
   tickChallenge(world); // challenge-mode constraint scoring (P4)
   tickTournament(world); // rival scoreboard (P4)
+  tickPreviews(world); // ephemeral preview environments expire (P5b)
+  tickPortal(world); // golden-path self-service deploys (P5b)
+  tickTraces(world); // distributed trace sampling (P5b)
   if (world.debt) {
     const team = world.team;
     if (team?.engineers.length) {
@@ -1196,6 +1220,9 @@ function baseCostItems(world: World): BaseItem[] {
     if (world.db.backups.enabled) items.push({ category: 'Database', label: `Automated backups (${world.db.backups.retentionDays}-day retention)`, monthlyCost: 18, cloud: true });
   }
   if (world.ci.staging?.image) items.push({ category: 'CI/CD', label: 'Staging environment runner', monthlyCost: 15, cloud: true });
+  if (world.zeroTrust?.meshInstalled) items.push({ category: 'Networking', label: 'Service mesh (identities + mTLS)', monthlyCost: 60, cloud: true });
+  if ((world.ci.previews ?? []).length) items.push({ category: 'CI/CD', label: `Preview environments (${(world.ci.previews ?? []).length} live)`, monthlyCost: 8 * (world.ci.previews ?? []).length, cloud: true });
+  if (world.db.pooler) items.push({ category: 'Database', label: 'Connection pooler (pgbouncer)', monthlyCost: 12, cloud: true });
   for (const p of world.products?.products ?? []) {
     if (p.launchedAtMin !== undefined) items.push({ category: 'Products', label: `${p.name} (infra)`, monthlyCost: p.infraMonthly, cloud: true });
   }
@@ -1870,4 +1897,338 @@ function tickChallenge(world: World): void {
       }
     }
   }
+}
+
+// =====================================================================
+// P5 — Trust & Scale: zero trust, compliance, portal, previews,
+// tracing, and the acquisition endgame.
+// =====================================================================
+
+// ----- zero trust (P5a, m34) -----
+
+export function ensureZeroTrust(world: World): ZeroTrustState {
+  if (!world.zeroTrust) {
+    world.zeroTrust = { meshInstalled: false, meshInstalledAtMin: 0, mtlsStrict: false, identities: [] };
+  }
+  return world.zeroTrust;
+}
+
+export function installMesh(world: World): { ok: boolean; message: string } {
+  const zt = ensureZeroTrust(world);
+  if (zt.meshInstalled) return { ok: false, message: 'service mesh already installed' };
+  zt.meshInstalled = true;
+  zt.meshInstalledAtMin = world.nowMin;
+  // the mesh issues a cryptographic identity to every serving component
+  zt.identities = ['api', 'db', 'lb', 'nginx'];
+  if (world.k8s?.provisioned) zt.identities.push('k8s-01');
+  audit(world, world.session.user, 'security', `Service mesh installed: every component now has a cryptographic identity (${zt.identities.join(', ')}) and speaks mTLS`);
+  return { ok: true, message: 'service mesh installed — identities issued, mTLS permissive until enforced' };
+}
+
+export function setMtlsStrict(world: World, strict: boolean): { ok: boolean; message: string } {
+  const zt = ensureZeroTrust(world);
+  if (!zt.meshInstalled) return { ok: false, message: 'install the service mesh first' };
+  zt.mtlsStrict = strict;
+  audit(world, world.session.user, 'security', strict
+    ? 'mTLS mode STRICT: plaintext service-to-service traffic is now refused cluster-wide'
+    : 'mTLS mode PERMISSIVE: plaintext tolerated again (interop window)');
+  return { ok: true, message: strict ? 'mTLS STRICT enforced' : 'mTLS permissive' };
+}
+
+// ----- compliance (P5a, m36) -----
+
+export function ensureCompliance(world: World): ComplianceState {
+  if (!world.compliance) {
+    world.compliance = { auditImmutable: false, bundles: [] };
+  }
+  return world.compliance;
+}
+
+/** The auditor's findings — derived live from world state, so remediation is real. */
+export function complianceFindings(world: World): ComplianceFinding[] {
+  const out: ComplianceFinding[] = [];
+  const web = world.hosts['web-01'];
+  const contractor = web.users['contractor'];
+  if (contractor?.sudo) {
+    out.push({ id: 'contractor-access', label: 'Contractor account retains sudo', severity: 'high', detail: 'user "contractor" still has sudo on web-01 — access review must revoke it' });
+  }
+  if (!world.compliance?.auditImmutable) {
+    out.push({ id: 'audit-mutable', label: 'Audit log is local and mutable', severity: 'high', detail: 'the audit trail lives in the game state — ship it to an append-only store' });
+  }
+  const active = world.ci.deployments.find((d) => d.active);
+  const img = active ? (world.registry.find((i) => i.repoTags.includes(active.image)) ?? world.docker.images.find((i) => i.repoTags.includes(active.image))) : undefined;
+  if (active && (!img?.signed || !img?.sbom)) {
+    out.push({ id: 'image-provenance', label: 'Running image lacks signature/SBOM', severity: 'medium', detail: `the production image ${active.image} has ${img?.signed ? 'no SBOM' : 'no signature'} — cosign sign + attest it` });
+  }
+  if (!world.vault?.credsLive) {
+    out.push({ id: 'secrets-plaintext', label: 'Database credentials not vault-managed', severity: 'medium', detail: 'the app still authenticates with credentials from a file — lease dynamic creds from the vault' });
+  }
+  if (!(world.compliance?.bundles.length)) {
+    out.push({ id: 'no-evidence', label: 'No evidence bundle collected', severity: 'low', detail: 'due diligence wants artifacts, not assertions — collect an evidence bundle' });
+  }
+  const unfiled = world.monitoring.incidents.filter((i) => i.status === 'resolved' && !i.postmortemFiled);
+  if (unfiled.length) {
+    out.push({ id: 'postmortems-missing', label: `${unfiled.length} resolved incident(s) without postmortems`, severity: 'low', detail: 'every resolved incident needs a filed postmortem (INCIDENTS tab)' });
+  }
+  return out;
+}
+
+/** Snapshot the security/reliability posture as a due-diligence artifact. */
+export function collectEvidence(world: World): EvidenceBundle {
+  const c = ensureCompliance(world);
+  const s = ensureSlos(world);
+  const vaultRotations = world.vault?.secrets['database/api']?.rotations ?? 0;
+  const active = world.ci.deployments.find((d) => d.active);
+  const bundle: EvidenceBundle = {
+    atMin: world.nowMin,
+    checks: [
+      { id: 'backups', label: 'automated backups enabled', ok: world.db.provisioned && world.db.backups.enabled },
+      { id: 'restore-drill', label: 'restore drill completed (RPO ≤ 24h)', ok: Boolean(world.flags.drRestoreDone) },
+      { id: 'slos', label: 'SLOs written and configured', ok: s.configured },
+      { id: 'vault', label: 'secrets vault-managed with rotation', ok: vaultRotations >= 1 },
+      { id: 'image-signing', label: 'production image signed + SBOM', ok: Boolean(active && imageSigned(world, active.image)) },
+      { id: 'netpol', label: 'default-deny network policy', ok: Object.values(world.k8s?.networkPolicies ?? {}).some((p) => p.defaultDeny) },
+      { id: 'mtls', label: 'mTLS strict', ok: Boolean(world.zeroTrust?.mtlsStrict) },
+      { id: 'postmortems', label: 'all incidents have postmortems', ok: world.monitoring.incidents.every((i) => i.postmortemFiled) },
+      { id: 'budget', label: 'infra budget set', ok: Boolean(world.finops?.budgetMonthly) }
+    ]
+  };
+  c.bundles.push(bundle);
+  if (c.bundles.length > 10) c.bundles.splice(0, c.bundles.length - 10);
+  audit(world, world.session.user, 'compliance', `Evidence bundle collected: ${bundle.checks.filter((x) => x.ok).length}/${bundle.checks.length} controls verified`);
+  return bundle;
+}
+
+export function enableAuditStore(world: World): { ok: boolean; message: string } {
+  const c = ensureCompliance(world);
+  if (c.auditImmutable) return { ok: false, message: 'audit log already ships to the append-only store' };
+  c.auditImmutable = true;
+  audit(world, world.session.user, 'compliance', 'Audit log now ships to an append-only store (WORM) — the trail can be evidenced, not edited');
+  return { ok: true, message: 'audit log append-only' };
+}
+
+export function revokeSudo(world: World, user: string): { ok: boolean; message: string } {
+  const u = world.hosts['web-01'].users[user];
+  if (!u) return { ok: false, message: `no user "${user}" on web-01` };
+  if (!u.sudo) return { ok: false, message: `${user} has no sudo` };
+  u.sudo = false;
+  u.groups = u.groups.filter((g) => g !== 'sudo');
+  audit(world, world.session.user, 'compliance', `Access review: sudo revoked for ${user} (least privilege)`);
+  return { ok: true, message: `sudo revoked for ${user}` };
+}
+
+// ----- developer portal (P5b, m37) -----
+
+export function ensurePortal(world: World): PortalState {
+  if (!world.portal) {
+    world.portal = {
+      enabled: false,
+      enabledAtMin: 0,
+      templates: [
+        { id: 'web-service', name: 'Web service (golden path)', description: 'build → test → scan → sign → deploy behind the LB. One click, all guardrails inherited.', published: false },
+        { id: 'background-worker', name: 'Background worker', description: 'queue consumer with autoscaling, dashboards and alerts wired automatically.', published: false },
+        { id: 'cron-job', name: 'Scheduled job', description: 'cron-shaped workload with retries, timeout and a dead-letter topic.', published: false }
+      ],
+      ticketQueue: 14,
+      devDeploys: 0,
+      deployLog: []
+    };
+  }
+  return world.portal;
+}
+
+export function enablePortal(world: World): { ok: boolean; message: string } {
+  const p = ensurePortal(world);
+  if (p.enabled) return { ok: false, message: 'portal already launched' };
+  p.enabled = true;
+  p.enabledAtMin = world.nowMin;
+  audit(world, world.session.user, 'platform', 'Internal developer portal launched — golden paths are one publish away');
+  return { ok: true, message: 'portal live — publish a golden path for the devs' };
+}
+
+export function publishTemplate(world: World, id: string): { ok: boolean; message: string } {
+  const p = ensurePortal(world);
+  const t = p.templates.find((x) => x.id === id);
+  if (!t) return { ok: false, message: `no template "${id}"` };
+  if (t.published) return { ok: false, message: `${t.name} is already published` };
+  t.published = true;
+  audit(world, world.session.user, 'platform', `Golden path published: ${t.name} — self-service for every developer, guardrails included`);
+  return { ok: true, message: `${t.name} published` };
+}
+
+const PORTAL_DEVS = ['priya', 'jaime', 'sam', 'wei', 'noor', 'diego'];
+
+/** Golden-path self-service: once templates are live, devs ship without tickets. */
+function tickPortal(world: World): void {
+  const p = world.portal;
+  if (!p?.enabled || !p.templates.some((t) => t.published)) return;
+  if (world.nowMin % 20 !== 0) return;
+  const dev = PORTAL_DEVS[Math.floor(world.nowMin / 20) % PORTAL_DEVS.length];
+  const svc = ['checkout-api', 'pdf-exporter', 'insights-etl', 'webhooks-relay', 'billing-sync'][Math.floor(world.nowMin / 40) % 5];
+  p.devDeploys += 1;
+  p.ticketQueue = Math.max(0, p.ticketQueue - 1);
+  p.deployLog.push({ atMin: world.nowMin, dev, service: `${svc} v${2 + (p.devDeploys % 9)}` });
+  if (p.deployLog.length > 12) p.deployLog.splice(0, p.deployLog.length - 10);
+  if (p.devDeploys % 3 === 1) {
+    audit(world, dev, 'platform', `${dev} shipped ${svc} via the golden path — no ticket, no platform bottleneck`);
+  }
+  if (p.ticketQueue === 0 && !world.flags.portalQueueDrained) {
+    world.flags.portalQueueDrained = true;
+    audit(world, 'system', 'platform', 'The deploy-ticket queue is EMPTY. The platform team ships the platform; developers ship the product.');
+  }
+}
+
+// ----- ephemeral preview environments (P5b, m38) -----
+
+function tickPreviews(world: World): void {
+  const previews = world.ci.previews;
+  if (!previews?.length) return;
+  const alive: typeof previews = [];
+  for (const p of previews) {
+    if (world.nowMin >= p.expiresAtMin) {
+      world.flags.previewsDestroyed = num(world.flags.previewsDestroyed) + 1;
+      audit(world, 'ci', 'deploy', `Preview ${p.id} auto-destroyed (expired) — ephemeral means ephemeral`);
+    } else {
+      alive.push(p);
+    }
+  }
+  world.ci.previews = alive;
+}
+
+// ----- distributed tracing (P5b, m39) -----
+
+export function enableTracing(world: World): { ok: boolean; message: string } {
+  if (world.flags.tracingEnabled) return { ok: false, message: 'tracing already enabled' };
+  world.flags.tracingEnabled = true;
+  audit(world, world.session.user, 'observability', 'Distributed tracing enabled — spans sampled every 5 sim minutes across lb → api → db');
+  return { ok: true, message: 'tracing live (MONITORING → TRACING)' };
+}
+
+/** Attribute recent latency to a service: the slowest span across recent traces. */
+export function analyzeTraces(world: World): { ok: boolean; message: string; attribution: { service: string; sharePct: number; avgMs: number }[] } {
+  const traces = (world.traces ?? []).slice(-10);
+  if (traces.length < 5) return { ok: false, message: 'not enough traces yet — let it sample (5+ traces needed)', attribution: [] };
+  const totals: Record<string, { sum: number; n: number }> = {};
+  for (const t of traces) {
+    for (const s of t.spans) {
+      totals[s.service] = totals[s.service] ?? { sum: 0, n: 0 };
+      totals[s.service].sum += s.durationMs;
+      totals[s.service].n += 1;
+    }
+  }
+  const grand = Object.values(totals).reduce((a, x) => a + x.sum, 0) || 1;
+  const attribution = Object.entries(totals)
+    .map(([service, x]) => ({ service, sharePct: Math.round((x.sum / grand) * 100), avgMs: Math.round(x.sum / x.n) }))
+    .sort((a, b) => b.sharePct - a.sharePct);
+  const top = attribution[0];
+  if (top && top.service === 'db' && top.sharePct >= 40) {
+    world.flags.traceBottleneckFound = true;
+    audit(world, world.session.user, 'observability', `Trace analysis: ${top.sharePct}% of request latency is the DATABASE (avg ${top.avgMs}ms/span) — connection churn under load, not the app`);
+  } else if (top) {
+    audit(world, world.session.user, 'observability', `Trace analysis: top contributor is ${top.service} at ${top.sharePct}% (avg ${top.avgMs}ms/span)`);
+  }
+  return { ok: true, message: `analyzed ${traces.length} traces`, attribution };
+}
+
+function tickTraces(world: World): void {
+  if (!world.flags.tracingEnabled || !world.monitoring.agentInstalled) return;
+  if (world.app.mode === 'stopped') return;
+  if (world.nowMin % 5 !== 0) return;
+  // db span: connection churn dominates when the DB runs hot; a pooler halves it
+  const dbMs = Math.round(18 + world.db.cpuPct * 9 * (world.db.pooler ? 0.5 : 1) + (world.flags.trafficSpike ? 30 : 0));
+  const apiMs = Math.round(9 + (world.monitoring.series.cpu_pct?.at(-1)?.v ?? 20) * 0.4);
+  const lbMs = 1 + (world.nowMin % 3);
+  const total = lbMs + apiMs + dbMs;
+  const trace: Trace = {
+    id: hashStr('trace' + world.nowMin).slice(0, 10),
+    atMin: world.nowMin,
+    path: '/api/orders',
+    durationMs: total,
+    spans: [
+      { service: 'lb', operation: 'lb-01 forward', durationMs: lbMs },
+      { service: 'api', operation: 'GET /api/orders', durationMs: apiMs },
+      { service: 'db', operation: 'SELECT orders', durationMs: dbMs }
+    ]
+  };
+  if (!world.traces) world.traces = [];
+  world.traces.push(trace);
+  if (world.traces.length > 50) world.traces.splice(0, world.traces.length - 40);
+  pushPoint(world, 'db_p95_ms', dbMs);
+}
+
+// ----- connection pooler (P5b, m39) -----
+
+export function enablePooler(world: World): { ok: boolean; message: string } {
+  if (!world.db.provisioned) return { ok: false, message: 'no managed database provisioned' };
+  if (world.db.pooler) return { ok: false, message: 'pgbouncer already enabled' };
+  world.db.pooler = true;
+  audit(world, world.session.user, 'db', 'Connection pooler (pgbouncer) enabled in front of Postgres — connection churn no longer burns latency');
+  return { ok: true, message: 'pgbouncer live — DB spans should shrink in the next traces' };
+}
+
+// ----- acquisition endgame (P5b, m40) -----
+
+/** Due diligence across the five pillars — every check is real world state. */
+export function dueDiligence(world: World): DueDiligencePillar[] {
+  const s = ensureSlos(world);
+  const report = sloReport(world);
+  const team = ensureTeam(world);
+  const products = ensureProducts(world);
+  const launched = products.products.filter((p) => p.launchedAtMin !== undefined);
+  const productShare = baseMrrOf(world) > 0 ? productMrrOf(world) / baseMrrOf(world) : 0;
+  const pillars: DueDiligencePillar[] = [
+    {
+      id: 'security',
+      label: 'Security & compliance posture',
+      pass: complianceFindings(world).length === 0,
+      detail: 'zero open audit findings (access reviewed, audit trail append-only, signed images, vault-managed secrets)'
+    },
+    {
+      id: 'reliability',
+      label: 'Reliability promises kept',
+      pass: Boolean(s.configured) && report.availabilityMet && report.budgetRemainingPct > 0,
+      detail: `SLOs ${s.configured ? 'written' : 'missing'}, availability ${report.availability.toFixed(2)}% (target ${s.availabilityTarget}%), error budget ${report.budgetRemainingPct.toFixed(0)}% remaining`
+    },
+    {
+      id: 'finops',
+      label: 'Unit economics under control',
+      pass: Boolean(world.finops?.budgetMonthly) && (world.finops?.daysUnderBudget ?? 0) >= 2,
+      detail: `budget ${world.finops?.budgetMonthly ? `$${world.finops.budgetMonthly}/mo` : 'not set'}, ${world.finops?.daysUnderBudget ?? 0} sim days held under it`
+    },
+    {
+      id: 'team',
+      label: 'The company runs without heroes',
+      pass: team.engineers.length >= 2 && Boolean(team.onCallId),
+      detail: `${team.engineers.length} engineer(s), on-call ${team.onCallId ? 'covered' : 'vacant'}`
+    },
+    {
+      id: 'products',
+      label: 'A portfolio, not a product',
+      pass: launched.length >= 2 && productShare >= 0.1,
+      detail: `${launched.length} product(s) launched, product MRR ${(productShare * 100).toFixed(0)}% of subscriptions`
+    }
+  ];
+  if (!world.endgame) world.endgame = { termSheetAccepted: false, pillars };
+  world.endgame.pillars = pillars;
+  return pillars;
+}
+
+/** Accept the term sheet: the company sells, a scale event is armed. */
+export function acceptTermSheet(world: World): { ok: boolean; message: string } {
+  const pillars = dueDiligence(world);
+  if (pillars.some((p) => !p.pass)) {
+    return { ok: false, message: `due diligence not clean: ${pillars.filter((p) => !p.pass).map((p) => p.id).join(', ')} still red` };
+  }
+  if (!world.endgame) world.endgame = { termSheetAccepted: false, pillars };
+  if (world.endgame.termSheetAccepted) return { ok: false, message: 'term sheet already accepted' };
+  const payout = 1_500_000 + pillars.filter((p) => p.pass).length * 100_000 + Math.floor(world.company.satisfaction * 50_000);
+  world.endgame.termSheetAccepted = true;
+  world.endgame.acceptedAtMin = world.nowMin;
+  world.endgame.payout = payout;
+  world.company.cash += payout;
+  // the announcement is the scale event: everyone tries the product at once
+  world.company.users = Math.round(world.company.users * 2.2);
+  world.scheduledEvents.push({ atMin: world.nowMin + 45, kind: 'exit_scale_check' });
+  audit(world, 'board', 'game', `TERM SHEET ACCEPTED: the company sells for $${payout.toLocaleString()}. The acquirers announce it in ~45 sim minutes — the traffic that follows is the final exam.`);
+  return { ok: true, message: `deal closed: +$${payout.toLocaleString()} — survive the announcement traffic` };
 }

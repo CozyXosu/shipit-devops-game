@@ -14,6 +14,7 @@ import { getFile, writeFile, resolvePath, getNode, listDir, nodeSizeMB } from '.
 import { currentMission, currentPackMission, evalRequirements, evaluateMissions, takeHint, fillTemplate, commandsRun, allMissionSummaries } from './engine';
 import { availablePacks, activatePack, currentPackMissionOf, getPack, packMissionsOf } from './missions/packs';
 import { status as gitStatus } from './sim/git';
+import { complianceFindings, collectEvidence, enableAuditStore, revokeSudo, installMesh, setMtlsStrict, enablePortal, publishTemplate, enableTracing, analyzeTraces, enablePooler, dueDiligence, acceptTermSheet } from './world';
 import { randomUUID } from 'crypto';
 
 export function createApi(storage: Storage): Router {
@@ -356,6 +357,100 @@ export function createApi(storage: Storage): Router {
     res.json(result);
   });
 
+  // ---- trust (P5a): mesh, compliance ----
+  api.post('/games/:id/cloud/mesh', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const action = String(req.body?.action ?? '');
+    const result = action === 'strict'
+      ? setMtlsStrict(state.world, true)
+      : installMesh(state.world);
+    evaluateMissions(state);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/compliance/evidence', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const bundle = collectEvidence(state.world);
+    evaluateMissions(state);
+    await storage.save(state);
+    res.json({ ok: true, message: `evidence collected: ${bundle.checks.filter((c) => c.ok).length}/${bundle.checks.length} controls verified`, bundle });
+  });
+
+  api.post('/games/:id/compliance/access', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = revokeSudo(state.world, String(req.body?.user ?? ''));
+    evaluateMissions(state);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/compliance/auditlog', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = enableAuditStore(state.world);
+    evaluateMissions(state);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  // ---- platform engineering (P5b): portal, tracing, pooler, endgame ----
+  api.post('/games/:id/portal/enable', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = enablePortal(state.world);
+    evaluateMissions(state);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/portal/templates/:templateId/publish', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = publishTemplate(state.world, req.params.templateId);
+    evaluateMissions(state);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/tracing/enable', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = enableTracing(state.world);
+    evaluateMissions(state);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/tracing/analyze', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = analyzeTraces(state.world);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/db/pooler', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = enablePooler(state.world);
+    evaluateMissions(state);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/endgame/accept', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = acceptTermSheet(state.world);
+    evaluateMissions(state);
+    await storage.save(state);
+    res.json(result);
+  });
+
   // ---- ecosystem (P3): providers, migration, products, FinOps ----
   api.post('/games/:id/cloud/compare', async (req, res) => {
     const state = await storage.load(req.params.id);
@@ -674,18 +769,21 @@ export function createApi(storage: Storage): Router {
       session: sessionView(state),
       git: gitInfo,
       docker: {
-        images: w.docker.images.map((i) => ({ tag: i.repoTags[0], sizeMB: i.sizeMB, user: i.user ?? 'root', healthcheck: Boolean(i.healthcheck), layers: i.layers.length })),
+        images: w.docker.images.map((i) => ({ tag: i.repoTags[0], sizeMB: i.sizeMB, user: i.user ?? 'root', healthcheck: Boolean(i.healthcheck), layers: i.layers.length, signed: Boolean(i.signed), sbom: Boolean(i.sbom) })),
         containers: w.docker.containers.map((c) => ({ name: c.name, image: c.image, status: c.status, healthy: c.healthy, port: c.hostPort })),
-        registry: w.registry.map((i) => ({ tag: i.repoTags[0], sizeMB: i.sizeMB }))
+        registry: w.registry.map((i) => ({ tag: i.repoTags[0], sizeMB: i.sizeMB, signed: Boolean(i.signed), sbom: Boolean(i.sbom) }))
       },
       ci: {
         runs: w.ci.runs.slice(-6).reverse(),
         deployments: w.ci.deployments.slice(-8).reverse(),
-        staging: w.ci.staging ? { image: w.ci.staging.image, e2ePassed: w.ci.staging.e2ePassed, e2eLog: w.ci.staging.e2eLog.slice(-6) } : null
+        staging: w.ci.staging ? { image: w.ci.staging.image, e2ePassed: w.ci.staging.e2ePassed, e2eLog: w.ci.staging.e2eLog.slice(-6) } : null,
+        previews: (w.ci.previews ?? []).map((p) => ({ id: p.id, image: p.image, url: p.url, createdAtMin: p.createdAtMin, minutesLeft: Math.max(0, p.expiresAtMin - w.nowMin) })),
+        previewsDestroyed: Number(w.flags.previewsDestroyed ?? 0)
       },
       db: {
         provisioned: w.db.provisioned, plan: w.db.plan, endpoint: w.db.endpoint,
         cpu: w.db.cpuPct, connections: w.db.connections, migrationsDone: w.db.migrationsDone,
+        pooler: Boolean(w.db.pooler),
         tables: Object.values(w.db.tables).map((t) => ({ name: t.name, rows: t.rowCount, indexes: t.indexes.map((i) => `${i.name}(${i.columns.join(',')})`) })),
         backups: {
           enabled: w.db.backups.enabled,
@@ -705,7 +803,9 @@ export function createApi(storage: Storage): Router {
         pods: w.k8s.pods.map((p) => ({ name: p.name, phase: p.phase, restarts: p.restarts, node: p.node, revision: p.revision })),
         services: Object.values(w.k8s.services).map((s) => ({ name: s.name, type: s.type, port: s.port, targetPort: s.targetPort, selector: s.selector, ingressIp: s.ingressIp ?? null })),
         ingresses: Object.values(w.k8s.ingresses).map((i) => ({ name: i.name, host: i.host, service: i.service })),
-        hpas: Object.values(w.k8s.hpas).map((h) => ({ name: h.name, deployment: h.deployment, min: h.minReplicas, max: h.maxReplicas, current: h.currentReplicas, peaked: h.peakedAtMin !== undefined }))
+        hpas: Object.values(w.k8s.hpas).map((h) => ({ name: h.name, deployment: h.deployment, min: h.minReplicas, max: h.maxReplicas, current: h.currentReplicas, peaked: h.peakedAtMin !== undefined })),
+        networkPolicies: Object.values(w.k8s.networkPolicies ?? {}).map((p) => ({ name: p.name, defaultDeny: p.defaultDeny, allows: p.allows })),
+        admissionPolicy: w.k8s.admissionPolicy ? { name: w.k8s.admissionPolicy.name, rule: w.k8s.admissionPolicy.rule } : null
       } : null,
       tf: w.tf ? {
         initialized: w.tf.initialized,
@@ -837,6 +937,61 @@ export function createApi(storage: Storage): Router {
             revenuePerUser: Math.round((totalMrr / Math.max(1, w.company.users)) * 100) / 100,
             grossMarginPct: margin
           }
+        };
+      })(),
+      // ---- P5a: trust ----
+      vault: (() => {
+        const v = w.vault;
+        if (!v) return null;
+        return {
+          enabled: v.enabled,
+          credsLive: v.credsLive,
+          secrets: Object.values(v.secrets).map((s) => ({ path: s.path, rotations: s.rotations, leases: s.dynamicLeases, lastRotatedAtMin: s.rotatedAtMin })),
+          leakDetected: Boolean(w.flags.vaultLeakDetected),
+          leakRevoked: Boolean(w.flags.vaultLeakRevoked)
+        };
+      })(),
+      zeroTrust: (() => {
+        const zt = w.zeroTrust;
+        if (!zt) return null;
+        return { meshInstalled: zt.meshInstalled, mtlsStrict: zt.mtlsStrict, identities: zt.identities };
+      })(),
+      compliance: (() => {
+        const c = w.compliance;
+        return {
+          auditImmutable: Boolean(c?.auditImmutable),
+          bundlesCount: c?.bundles.length ?? 0,
+          lastBundle: c?.bundles.slice(-1)[0] ? { atMin: c.bundles[c.bundles.length - 1].atMin, checks: c.bundles[c.bundles.length - 1].checks } : null,
+          findings: complianceFindings(w),
+          users: Object.values(w.hosts['web-01'].users).map((u) => ({ name: u.name, sudo: u.sudo, groups: u.groups }))
+        };
+      })(),
+      // ---- P5b: platform ----
+      portal: (() => {
+        const p = w.portal;
+        if (!p) return null;
+        return {
+          enabled: p.enabled,
+          templates: p.templates,
+          ticketQueue: p.ticketQueue,
+          devDeploys: p.devDeploys,
+          deployLog: p.deployLog.slice(-10).reverse()
+        };
+      })(),
+      tracing: {
+        enabled: Boolean(w.flags.tracingEnabled),
+        bottleneckFound: Boolean(w.flags.traceBottleneckFound),
+        dbP95: latestOf('db_p95_ms'),
+        traces: (w.traces ?? []).slice(-8).reverse().map((t) => ({ id: t.id, atMin: t.atMin, path: t.path, durationMs: t.durationMs, spans: t.spans }))
+      },
+      endgame: (() => {
+        const pillars = dueDiligence(w);
+        return {
+          pillars,
+          termSheetAccepted: Boolean(w.endgame?.termSheetAccepted),
+          payout: w.endgame?.payout ?? null,
+          scaleEventSurvived: Boolean(w.flags.scaleEventSurvived),
+          legendMode: Boolean(w.flags.legendMode)
         };
       })(),
       architecture: { nodes, edges },

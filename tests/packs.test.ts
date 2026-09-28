@@ -255,7 +255,7 @@ describe('P4 chain m29 → m32', () => {
     evalM(s);
     expect(s.missions.completed).toContain('m32-access');
     expect(s.world.flags.scalePhaseComplete).toBe(true);
-    expect(currentMission(s)).toBeNull(); // the chain is complete
+    expect(currentMission(s)?.id).toBe('m33-vault'); // P5 continues the chain
     expect(s.missions.ratings['m32-access']).toBeDefined();
   });
 });

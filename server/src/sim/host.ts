@@ -9,6 +9,7 @@ import { getRepo, findRepoFor, initRepo, status as gitStatus, makeCommit, mergeB
 import { buildImage, runContainer, pushToRegistry, parseDockerfile, hashStr } from './docker';
 import { runSql } from './dbsim';
 import { kubectlCmd } from './k8s';
+import { vaultCmd } from './vault';
 import { terraformCmd, ensureTfState } from './terraform';
 
 export interface CmdOut { lines: OutLine[]; code: number }
@@ -643,8 +644,88 @@ const COMMANDS: Record<string, Handler> = {
   kubectl: (w, _h, argv) => {
     const res = kubectlCmd(w, argv);
     return { lines: res.lines, code: res.code };
+  },
+  vault: (w, h, argv) => {
+    if (!h.packages.includes('vault')) {
+      return { lines: [L('vault: command not found — install it first: sudo apt-get install -y vault', 'err')], code: 127 };
+    }
+    const res = vaultCmd(w, argv);
+    return { lines: res.lines, code: res.code };
+  },
+  cosign: (w, h, argv) => {
+    if (!h.packages.includes('cosign')) {
+      return { lines: [L('cosign: command not found — install it first: sudo apt-get install -y cosign', 'err')], code: 127 };
+    }
+    const res = cosignCmd(w, argv);
+    return { lines: res.lines, code: res.code };
   }
 };
+
+/** `cosign` CLI (P5a): sign images, attach SBOM attestations, verify them. */
+function cosignCmd(w: World, argv: string[]): CmdOut {
+  const e = (t: string): CmdOut => ({ lines: [L(t, 'err')], code: 1 });
+  const sub = argv[1];
+  const tag = argv[2];
+
+  const findImage = (t: string) =>
+    w.registry.find((i) => i.repoTags.includes(t)) ?? w.docker.images.find((i) => i.repoTags.includes(t));
+
+  switch (sub) {
+    case undefined:
+    case 'help':
+    case '--help':
+      return { lines: [
+        L('cosign — container signing (simulated)', 'hdr'),
+        L('sign <image>             sign an image (keyless, recorded in the transparency log)'),
+        L('attest --type sbom <img> attach an SBOM attestation (SPDX)'),
+        L('verify <image>           check signature + attestations')
+      ], code: 0 };
+    case 'sign': {
+      if (!tag) return e('usage: cosign sign <image>');
+      const img = findImage(tag);
+      if (!img) return e(`cosign: no image found for tag ${tag}`);
+      img.signed = true;
+      w.audit.push({ t: w.nowMin, actor: w.session.user, kind: 'security', text: `Image signed: ${tag} (keyless, transparency log entry recorded)` });
+      return { lines: [
+        L('Generating ephemeral keys…', 'dim'),
+        L('Retrieving signed certificate…', 'dim'),
+        L(`Signing [${tag}]`, 'dim'),
+        L(`Signature pushed to registry for ${tag} (sha256:${hashStr(tag + 'sig').slice(0, 19)})`, 'ok'),
+        L('Transparency log entry created (rekor)', 'dim')
+      ], code: 0 };
+    }
+    case 'attest': {
+      // accept `cosign attest --type sbom <img>` and `cosign attest <img>`
+      const target = tag && !tag.startsWith('-') ? tag : argv[argv.length - 1];
+      const img = findImage(target);
+      if (!img) return e(`cosign: no image found for tag ${target}`);
+      if (!img.signed) return e(`cosign: ${target} is not signed — sign it first (admission policy requires provenance)`);
+      img.sbom = true;
+      w.audit.push({ t: w.nowMin, actor: w.session.user, kind: 'security', text: `SBOM attestation attached to ${target} (SPDX, 148 packages)` });
+      return { lines: [
+        L(`Using payload from: ${target}`, 'dim'),
+        L('Generating SBOM (syft, spdx-json): 148 packages, 0 criticals', 'dim'),
+        L(`Attestation pushed to registry for ${target}`, 'ok')
+      ], code: 0 };
+    }
+    case 'verify': {
+      if (!tag) return e('usage: cosign verify <image>');
+      const img = findImage(tag);
+      if (!img) return e(`cosign: no image found for tag ${tag}`);
+      const lines: OutLine[] = [];
+      if (!img.signed) {
+        lines.push(L(`No signatures found for ${tag}`, 'err'));
+        return { lines, code: 1 };
+      }
+      lines.push(L(`Verified OK for ${tag}`, 'ok'));
+      lines.push(L(`  signature: sha256:${hashStr(tag + 'sig').slice(0, 19)} (keyless, identity you@${w.company.slug}.dev)`, 'dim'));
+      lines.push(L(img.sbom ? '  attestation: sbom/spdx present (148 packages)' : '  attestation: none', img.sbom ? 'dim' : 'warn'));
+      return { lines, code: 0 };
+    }
+    default:
+      return e(`unknown command "${sub}" — try cosign help`);
+  }
+}
 
 function env(w: World): Record<string, string> { return w.session.env; }
 
@@ -760,8 +841,10 @@ const APT_PACKAGES: Record<string, { desc: string; sizeMB: number }> = {
   logrotate: { desc: 'Log rotation utility', sizeMB: 1 },
   'postgresql-client': { desc: 'front-end programs for PostgreSQL', sizeMB: 12 },
   htop: { desc: 'interactive processes viewer', sizeMB: 2 },
-  sqlite3: { desc: 'Command line interface for SQLite', sizeMB: 3 },
-  terraform: { desc: 'infrastructure-as-code tool (HashiCorp)', sizeMB: 39 }
+  sqlite3: { desc: 'Command line interface to SQLite', sizeMB: 3 },
+  terraform: { desc: 'infrastructure-as-code tool (HashiCorp)', sizeMB: 39 },
+  vault: { desc: 'secrets management tool (HashiCorp)', sizeMB: 48 },
+  cosign: { desc: 'container signing, verification and storage in an OCI registry', sizeMB: 22 }
 };
 
 function aptCmd(w: World, h: SimHost, argv: string[]): CmdOut {

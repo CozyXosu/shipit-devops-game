@@ -74,13 +74,13 @@ describe('mission engine', () => {
     expect(s.missions.hintsUsed['m01-ssh']).toBe(3);
   });
 
-  it('mission summaries report statuses; 32 missions across build + operate + ecosystem + bonus', () => {
+  it('mission summaries report statuses; 40 missions across build + operate + ecosystem + bonus + trust + platform', () => {
     const s = stateOf(createWorld('Acme Metrics', 'you'));
     s.missions.current = 'm01-ssh';
     const sums = allMissionSummaries(s);
     expect(sums.find((m) => m.id === 'm01-ssh')?.status).toBe('active');
     expect(sums.find((m) => m.id === 'm02-dead-api')?.status).toBe('locked');
-    expect(sums.length).toBe(32);
+    expect(sums.length).toBe(40);
   });
 
   it('evaluateMissions is a no-op with no current mission', () => {

@@ -19,7 +19,7 @@ type Dict = Record<string, string>;
 const EN: Dict = {
   'tab.missions': 'MISSIONS', 'tab.terminal': 'TERMINAL', 'tab.editor': 'EDITOR', 'tab.dashboard': 'DASHBOARD',
   'tab.ci': 'CI / CD', 'tab.k8s': 'KUBERNETES', 'tab.database': 'DATABASE', 'tab.monitoring': 'MONITORING',
-  'tab.cloud': 'CLOUD', 'tab.company': 'COMPANY', 'tab.costs': 'COSTS', 'tab.incidents': 'INCIDENTS', 'tab.modes': 'MODES',
+  'tab.cloud': 'CLOUD', 'tab.company': 'COMPANY', 'tab.costs': 'COSTS', 'tab.incidents': 'INCIDENTS', 'tab.portal': 'PORTAL', 'tab.modes': 'MODES',
   'top.day': 'Day', 'top.cash': 'Cash', 'top.users': 'Users', 'top.uptime': 'Uptime', 'top.infra': 'Infra', 'top.exit': 'exit',
   'top.pause': 'pause', 'top.speed': 'speed',
   'landing.sub': 'A DevOps company simulator. One broken server. One demo at 10:30. Build the platform, run the company.',
@@ -52,7 +52,7 @@ const EN: Dict = {
 const ES: Dict = {
   'tab.missions': 'MISIONES', 'tab.terminal': 'TERMINAL', 'tab.editor': 'EDITOR', 'tab.dashboard': 'PANEL',
   'tab.ci': 'CI / CD', 'tab.k8s': 'KUBERNETES', 'tab.database': 'BASE DE DATOS', 'tab.monitoring': 'MONITOREO',
-  'tab.cloud': 'NUBE', 'tab.company': 'EMPRESA', 'tab.costs': 'COSTOS', 'tab.incidents': 'INCIDENTES', 'tab.modes': 'MODOS',
+  'tab.cloud': 'NUBE', 'tab.company': 'EMPRESA', 'tab.costs': 'COSTOS', 'tab.incidents': 'INCIDENTES', 'tab.portal': 'PORTAL', 'tab.modes': 'MODOS',
   'top.day': 'Día', 'top.cash': 'Caja', 'top.users': 'Usuarios', 'top.uptime': 'Disponibilidad', 'top.infra': 'Infra', 'top.exit': 'salir',
   'top.pause': 'pausa', 'top.speed': 'velocidad',
   'landing.sub': 'Un simulador de empresa DevOps. Un servidor roto. Una demo a las 10:30. Construye la plataforma, dirige la empresa.',
@@ -85,7 +85,7 @@ const ES: Dict = {
 const DE: Dict = {
   'tab.missions': 'MISSIONEN', 'tab.terminal': 'TERMINAL', 'tab.editor': 'EDITOR', 'tab.dashboard': 'ÜBERSICHT',
   'tab.ci': 'CI / CD', 'tab.k8s': 'KUBERNETES', 'tab.database': 'DATENBANK', 'tab.monitoring': 'MONITORING',
-  'tab.cloud': 'CLOUD', 'tab.company': 'FIRMA', 'tab.costs': 'KOSTEN', 'tab.incidents': 'VORFÄLLE', 'tab.modes': 'MODI',
+  'tab.cloud': 'CLOUD', 'tab.company': 'FIRMA', 'tab.costs': 'KOSTEN', 'tab.incidents': 'VORFÄLLE', 'tab.portal': 'PORTAL', 'tab.modes': 'MODI',
   'top.day': 'Tag', 'top.cash': 'Kasse', 'top.users': 'Nutzer', 'top.uptime': 'Verfügbarkeit', 'top.infra': 'Infra', 'top.exit': 'beenden',
   'top.pause': 'pause', 'top.speed': 'tempo',
   'landing.sub': 'Ein DevOps-Firmensimulator. Ein kaputter Server. Eine Demo um 10:30. Baue die Plattform, führe die Firma.',

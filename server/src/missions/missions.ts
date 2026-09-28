@@ -5,8 +5,8 @@ import * as fs from '../sim/fs';
 import { inspectDockerfile } from '../sim/host';
 import { status as gitStatus, isIgnored } from '../sim/git';
 import { parseNginxSites, httpRequest, hostServesApi } from '../sim/net';
-import { analyzeStages, loadPipeline } from '../sim/ci';
-import { diskUsagePct, audit, sloReport, ensureCloud, ensureProducts, productMrrOf, baseMrrOf, setFinopsBaseline, monthlyInfraCost } from '../world';
+import { analyzeStages, loadPipeline, hasPreviewStep } from '../sim/ci';
+import { diskUsagePct, audit, sloReport, ensureCloud, ensureProducts, productMrrOf, baseMrrOf, setFinopsBaseline, monthlyInfraCost, complianceFindings, dueDiligence } from '../world';
 
 export interface Requirement { id: string; label: string; check: (w: World) => boolean }
 
@@ -14,7 +14,7 @@ export interface MissionDef {
   id: string;
   index: number;
   title: string;
-  phase: 'build' | 'operate' | 'ecosystem' | 'bonus';
+  phase: 'build' | 'operate' | 'ecosystem' | 'bonus' | 'trust' | 'platform';
   story: string;
   objective: string;
   coaching: string;
@@ -56,7 +56,7 @@ function missionApiContainer(w: World): boolean {
 // =====================================================================
 // MISSIONS
 // =====================================================================
-import { k8sServes } from '../sim/k8s';
+import { k8sServes, imageSigned } from '../sim/k8s';
 
 export const MISSIONS: MissionDef[] = [
   // -------------------------------------------------------- 1
@@ -1049,6 +1049,247 @@ export const MISSIONS: MissionDef[] = [
     onComplete: (w) => {
       w.flags.scalePhaseComplete = true;
       audit(w, 'system', 'game', 'P4 MILESTONE COMPLETE — 32 missions, four phases. You built the platform, ran the company, scaled the ecosystem, and made it work for everyone. SHIP IT. (Sandbox, challenges and packs remain — the world keeps happening.)');
+    }
+  },
+  // -------------------------------------------------------- 33
+  {
+    id: 'm33-vault',
+    index: 33,
+    title: 'The keys to the kingdom',
+    phase: 'trust',
+    story: 'The penetration test lands with a thud. Finding #1, in bold: the production database password lives in a file on disk, and a copy sits in git history from the dark ages. The fix is not a new password — it is a new pattern: a secrets manager that generates, leases and rotates credentials while no human ever sees them.',
+    objective: 'Install the vault, store the DB secret, lease DYNAMIC credentials to the app, and rotate with zero downtime. Then a stray file will appear — scan for the leak and rotate the leaked value into oblivion.',
+    coaching: 'sudo apt-get install -y vault, then: vault status (initializes), vault put database/api, vault lease database/api (dynamic creds), vault rotate database/api. When the audit feed mentions a stray file: vault scan, then vault rotate again.',
+    skills: ['security'],
+    requirements: [
+      { id: 'vault-installed', label: 'vault installed', check: (w) => w.hosts['web-01'].packages.includes('vault') },
+      { id: 'secret-stored', label: 'The DB secret is vault-managed (vault put database/api)', check: (w) => Boolean(w.vault?.enabled && w.vault.secrets['database/api']) },
+      { id: 'dynamic-creds', label: 'Dynamic credentials leased — the app authenticates via the vault', check: (w) => Boolean(w.vault?.credsLive) },
+      { id: 'rotated', label: 'Secret rotated with zero downtime (DB still healthy)', check: (w) => {
+        const s = w.vault?.secrets['database/api'];
+        const res = httpRequest(w, 'http://localhost:8080/health');
+        return Boolean(s && s.rotations >= 1 && res.ok && res.status === 200);
+      } },
+      { id: 'leak-cleaned', label: 'Leak found by scan and killed by rotation', check: (w) => Boolean(w.flags.vaultLeakDetected && w.flags.vaultLeakRevoked) }
+    ],
+    hints: [
+      'Install + initialize: sudo apt-get install -y vault && vault status. Then store the secret (value is generated inside the vault, never typed): vault put database/api',
+      'Dynamic credentials: vault lease database/api — the app now authenticates with vault-issued creds (TTL 60m, auto-renewed). Then prove rotation is boring: vault rotate database/api — the database accepts the new pair mid-flight.',
+      'A stray file will appear in the audit feed (~40 sim minutes — 16× helps). Run: vault scan — it finds live secret material outside the vault. Kill it: vault rotate database/api. The leaked value now authenticates nothing.'
+    ],
+    rewards: { cash: 6000, xp: { security: 60 } },
+    onStart: (w) => {
+      w.scheduledEvents.push({ atMin: w.nowMin + 40, kind: 'secret_leak' });
+      audit(w, 'maya', 'game', 'Maya: "Pen-test finding #1: the DB password is a FILE. Patterns, not values — vault, dynamic creds, rotation. Oh, and interns back up things they shouldn\'t."');
+    },
+    onComplete: (w) => audit(w, 'system', 'game', 'Secrets are infrastructure now: generated, leased, rotated — and leaks die in one command.')
+  },
+  // -------------------------------------------------------- 34
+  {
+    id: 'm34-zerotrust',
+    index: 34,
+    title: 'Nobody gets root',
+    phase: 'trust',
+    story: 'The enterprise contract comes with a security questionnaire. Question 7: "list every identity that may talk to your database, and prove nothing else can." You currently have no answer — the network is a suburb where every service can visit every other service.',
+    objective: 'Install the service mesh and enforce STRICT mTLS (every service gets a cryptographic identity). Add default-deny NetworkPolicies to the cluster with exactly one allowance: api → db on 5432. And the api Deployment must run non-root.',
+    coaching: 'CLOUD tab → Service mesh: INSTALL, then ENFORCE STRICT mTLS. Then (web-01) write /opt/app/k8s/netpol.yaml with a default-deny policy and an allow rule, kubectl apply -f k8s/. For non-root: add securityContext runAsNonRoot to the deployment manifest and re-apply.',
+    skills: ['security', 'architecture'],
+    requirements: [
+      { id: 'mesh', label: 'Service mesh installed (identities issued)', check: (w) => Boolean(w.zeroTrust?.meshInstalled) },
+      { id: 'strict', label: 'mTLS STRICT enforced (plaintext refused)', check: (w) => Boolean(w.zeroTrust?.mtlsStrict) },
+      { id: 'identities', label: 'Every production service has an identity', check: (w) => {
+        const ids = w.zeroTrust?.identities ?? [];
+        return ids.includes('api') && ids.includes('db');
+      } },
+      { id: 'netpol-deny', label: 'Default-deny NetworkPolicy applied', check: (w) => Object.values(w.k8s?.networkPolicies ?? {}).some((p) => p.defaultDeny) },
+      { id: 'netpol-allow', label: 'One allowance: api → db on 5432 (and nothing else)', check: (w) => Object.values(w.k8s?.networkPolicies ?? {}).some((p) => p.allows.some((a) => a.fromSelector.includes('api') && a.port === 5432)) },
+      { id: 'non-root', label: 'api Deployment sets securityContext.runAsNonRoot', check: (w) => w.k8s?.deployments['api']?.runAsNonRoot === true }
+    ],
+    hints: [
+      'CLOUD tab → SERVICE MESH → INSTALL (identities for api, db, lb, nginx), then ENFORCE STRICT mTLS. Permissive mode is a migration window, not a posture.',
+      'EDITOR → /opt/app/k8s/netpol.yaml (two documents, one file):\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: default-deny\nspec:\n  podSelector: {}\n  policyTypes:\n    - Ingress\n---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: allow-api-to-db\nspec:\n  podSelector:\n    matchLabels:\n      app: api\n  ingress:\n    - from:\n        - podSelector:\n            matchLabels:\n              app: api\n      ports:\n        - port: 5432\nThen: kubectl apply -f k8s/ and kubectl get netpol',
+      'Least privilege for the workload itself: EDITOR → k8s/deployment.yaml, inside the api container add:\n          securityContext:\n            runAsNonRoot: true\nRe-apply with kubectl apply -f k8s/. Verify: kubectl describe deployment api (Security: runAsNonRoot=yes).'
+    ],
+    rewards: { cash: 7000, xp: { security: 50, architecture: 30 } },
+    onStart: (w) => audit(w, 'enterprise buyer', 'game', 'Security questionnaire, question 7: "list every identity that may talk to your database, and prove nothing else can." Answer it with architecture, not adjectives.'),
+    onComplete: (w) => audit(w, 'system', 'game', 'Zero trust: every connection now has a name, a certificate and a reason. The questionnaire answer is one sentence long.')
+  },
+  // -------------------------------------------------------- 35
+  {
+    id: 'm35-supplychain',
+    index: 35,
+    title: 'Chain of custody',
+    phase: 'trust',
+    story: 'An acquirer\'s intern with a clipboard asks the question you cannot answer yet: "prove that the image running in production is the image your pipeline built." You cannot. Anything could have pushed that tag. Time for signatures, SBOMs, and an admission policy with teeth.',
+    objective: 'Sign the production image with cosign and attach an SBOM. Apply an admission Policy that BLOCKS unsigned images — prove it by trying to roll out the unsigned :v3 first (watch it bounce). Then ship :v3 signed, and make CI sign automatically.',
+    coaching: 'sudo apt-get install -y cosign. Build + push :v3 (edit the pipeline tag or docker build/push by hand). Try kubectl set image → DENIED (that is the proof). Then: cosign sign registry.acme.dev/acme/api:v3, cosign attest --type sbom registry.acme.dev/acme/api:v3, and roll out again. Finally add a cosign sign step to the pipeline.',
+    skills: ['security', 'cicd'],
+    requirements: [
+      { id: 'policy', label: 'Admission policy active: unsigned images rejected', check: (w) => w.k8s?.admissionPolicy?.rule === 'signed-images' },
+      { id: 'gate-proven', label: 'The gate proved itself: an unsigned rollout was DENIED', check: (w) => Boolean(w.flags.admissionBlocked) },
+      { id: 'signed', label: 'The running production image is signed', check: (w) => {
+        const img = w.ci.deployments.find((d) => d.active)?.image;
+        return Boolean(img && imageSigned(w, img));
+      } },
+      { id: 'sbom', label: 'The running image carries an SBOM attestation', check: (w) => {
+        const img = w.ci.deployments.find((d) => d.active)?.image;
+        const reg = w.registry.find((i) => i.repoTags.includes(img ?? ''));
+        return Boolean(reg?.sbom);
+      } },
+      { id: 'ci-signs', label: 'CI signs what it ships (cosign step in the pipeline)', check: (w) => {
+        const p = loadPipeline(w, '/opt/app', '.ci/pipeline.yml');
+        return p.valid && p.steps.some((s) => /^cosign\s+sign/.test(s.run ?? '') || (/sign/i.test(s.name) && /cosign/.test(s.run ?? '')));
+      } }
+    ],
+    hints: [
+      'The policy is a manifest (EDITOR → /opt/app/k8s/policy.yaml):\napiVersion: policy.shipit.dev/v1\nkind: Policy\nmetadata:\n  name: require-signed-images\nspec:\n  requireSignedImages: true\nkubectl apply -f k8s/ — then kubectl get policy',
+      'Prove the gate: build + push the next release unsigned (docker build -t registry.acme.dev/acme/api:v3 . && docker push registry.acme.dev/acme/api:v3), then kubectl set image deployment/api api=registry.acme.dev/acme/api:v3 — DENIED by the admission webhook. That rejection is the whole point.',
+      'Now ship it properly: cosign sign registry.acme.dev/acme/api:v3 && cosign attest --type sbom registry.acme.dev/acme/api:v3 — then the rollout goes through. Last: make CI do this forever — add after the push step:\n  - name: sign\n    run: cosign sign registry.acme.dev/acme/api:v3\ncommit + run the pipeline.'
+    ],
+    rewards: { cash: 7000, xp: { security: 50, cicd: 30 } },
+    onStart: (w) => audit(w, 'acquirer intern', 'game', 'Due diligence, supply chain section: "prove the running image is the image you built." Signatures or it did not happen.'),
+    onComplete: (w) => audit(w, 'system', 'game', 'Chain of custody closed: unsigned code physically cannot reach the cluster, and CI signs everything it ships.')
+  },
+  // -------------------------------------------------------- 36
+  {
+    id: 'm36-audit',
+    index: 36,
+    title: 'The auditor cometh',
+    phase: 'trust',
+    story: 'The enterprise deal needs a real audit. The auditor arrives with a lanyard, a template, and zero sympathy. The good news: you built evidence-generating systems for 35 missions. The bad news: nobody ever reviewed access, and the audit trail can theoretically be edited.',
+    objective: 'COMPANY tab → COMPLIANCE: run the access review (revoke the contractor\'s sudo), ship the audit log to an append-only store, fix every finding, and collect an evidence bundle for the auditors.',
+    coaching: 'COMPANY → COMPLIANCE shows live findings — each maps to a real fix (INCIDENTS postmortems, cosign, vault). Revoke the contractor, enable the append-only audit store, then COLLECT EVIDENCE. Zero findings = a clean data room.',
+    skills: ['security', 'architecture'],
+    requirements: [
+      { id: 'access-review', label: 'Access review done: the contractor has no sudo', check: (w) => !w.hosts['web-01'].users['contractor']?.sudo },
+      { id: 'audit-immutable', label: 'Audit log ships to an append-only store', check: (w) => Boolean(w.compliance?.auditImmutable) },
+      { id: 'evidence', label: 'Evidence bundle collected (artifacts, not assertions)', check: (w) => (w.compliance?.bundles.length ?? 0) >= 1 },
+      { id: 'findings-clean', label: 'Zero open audit findings', check: (w) => complianceFindings(w).length === 0 }
+    ],
+    hints: [
+      'COMPANY tab → COMPLIANCE → Access review: the "contractor" account still has sudo on web-01 (from the migration era). REVOKE it.',
+      'Same panel: ENABLE APPEND-ONLY AUDIT STORE — the trail becomes evidence-grade (WORM). Then look at the findings list: each one names its fix; most are things earlier missions already taught you.',
+      'When the findings list is empty: COLLECT EVIDENCE BUNDLE. It snapshots backups, SLOs, vault rotation, image signing, netpol, mTLS and postmortems — the auditor leaves with artifacts, not promises.'
+    ],
+    rewards: { cash: 8000, xp: { security: 40, architecture: 40 } },
+    onStart: (w) => {
+      const web = w.hosts['web-01'];
+      web.users['contractor'] = { name: 'contractor', uid: 1400, sudo: true, groups: ['contractor', 'sudo'] };
+      audit(w, 'auditor', 'game', 'AUDIT OPENED. Finding #1 already written down: "a contractor account with sudo outlived its project." The lanyard sees everything.');
+    },
+    onComplete: (w) => {
+      w.flags.trustPhaseComplete = true;
+      audit(w, 'system', 'game', 'P5a MILESTONE COMPLETE — the security arc: secrets, identity, supply chain, evidence. The company can now PROVE it is trustworthy, which is worth more than being trustworthy.');
+    }
+  },
+  // -------------------------------------------------------- 37
+  {
+    id: 'm37-portal',
+    index: 37,
+    title: 'Golden paths',
+    phase: 'platform',
+    story: 'You are the bottleneck. Fourteen deploy tickets deep, every one a human asking you for permission to ship. The platform you built is GOOD — so good that developers should be able to walk the golden path themselves: one click, all guardrails inherited.',
+    objective: 'Launch the internal developer portal (PORTAL tab), publish the web-service golden path, and let developers ship without tickets — until the deploy-ticket queue hits zero.',
+    coaching: 'PORTAL tab → LAUNCH PORTAL, then PUBLISH the web-service golden path. Watch the activity feed: every ~20 sim minutes a developer ships something themselves (16× speed helps). The ticket queue drains as they do.',
+    skills: ['architecture', 'cicd'],
+    requirements: [
+      { id: 'portal-enabled', label: 'The developer portal is live', check: (w) => Boolean(w.portal?.enabled) },
+      { id: 'template-published', label: 'A golden path is published (self-service with guardrails)', check: (w) => Boolean(w.portal?.templates.some((t) => t.published)) },
+      { id: 'dev-deploys', label: 'At least three developers shipped via the golden path', check: (w) => (w.portal?.devDeploys ?? 0) >= 3 },
+      { id: 'queue-zero', label: 'The deploy-ticket queue is empty', check: (w) => (w.portal?.ticketQueue ?? 99) === 0 }
+    ],
+    hints: [
+      'PORTAL tab (sidebar) → LAUNCH PORTAL. The portal wraps YOUR pipeline: tests, scans, signing, deploy — one paved road.',
+      'PUBLISH the "Web service" golden path. Published = self-service for every developer; the guardrails (signing, probes, alerts) are inherited, not optional.',
+      'Now get out of the way: at 16× speed, a developer ships via the portal every ~20 sim minutes and the ticket queue drains one ticket per ship. Watch the feed — priya, jaime, sam and friends do not need you anymore. That is the point.'
+    ],
+    rewards: { cash: 8000, xp: { architecture: 50, cicd: 30 } },
+    onStart: (w) => audit(w, 'jordan (founder)', 'game', 'Jordan: "Fourteen open deploy tickets. YOU are the ticket queue. Launch the portal — I want developers shipping while you sleep."'),
+    onComplete: (w) => audit(w, 'system', 'game', 'Golden paths: the platform team ships the platform, developers ship the product. The ticket queue is a museum exhibit.')
+  },
+  // -------------------------------------------------------- 38
+  {
+    id: 'm38-previews',
+    index: 38,
+    title: 'Every PR gets a stage',
+    phase: 'platform',
+    story: 'Product review meetings are 40 minutes of "works on my laptop" and "I think that\'s the old build". Every pull request deserves its own stage: an ephemeral environment that exists exactly as long as the review does, then destroys itself.',
+    objective: 'Add a preview step to the pipeline. Run it twice (two "PRs") — each run must spin up its own ephemeral environment with a URL. Verify one with curl, and prove they are ephemeral: let one auto-destroy.',
+    coaching: 'EDIT .ci/pipeline.yml — add after the push step:\n  - name: preview\n    uses: sim/preview\nCommit, then RUN PIPELINE twice. Each run gets pr-N.preview.{domain}. curl one. Wait 120 sim minutes and watch the first one destroy itself (16×).',
+    skills: ['cicd'],
+    requirements: [
+      { id: 'preview-step', label: 'Pipeline has a preview step (committed)', check: (w) => {
+        if (!w.git['/opt/app']) return false;
+        const p = loadPipeline(w, '/opt/app', '.ci/pipeline.yml');
+        return p.valid && hasPreviewStep(p);
+      } },
+      { id: 'previews-created', label: 'Two distinct preview environments spun up (one per run)', check: (w) => Number(w.flags.previewCounter ?? 0) >= 2 },
+      { id: 'preview-serves', label: 'A live preview answers on its own URL', check: (w) => (w.ci.previews ?? []).some((p) => {
+        const res = httpRequest(w, `http://${p.url}/health`);
+        return res.ok && res.status === 200;
+      }) },
+      { id: 'ephemeral', label: 'Ephemerality proven: a preview auto-destroyed on schedule', check: (w) => Number(w.flags.previewsDestroyed ?? 0) >= 1 }
+    ],
+    hints: [
+      'EDITOR → .ci/pipeline.yml, add after push:\n  - name: preview\n    uses: sim/preview\nThen commit (git add .ci/pipeline.yml && git commit -m "preview envs").',
+      'CI tab → RUN PIPELINE. The run spins up pr-1.preview.{domain} with the image it just built. Run it AGAIN for a second PR: pr-2 gets its own isolated environment.',
+      'curl http://pr-1.preview.{domain}/health works from the laptop — that is a full environment per PR. Now prove ephemerality: let pr-1 age (it self-destructs 120 sim minutes after birth), then RUN PIPELINE again so a fresh pr-2 is live while the old one is gone. Ephemeral is a promise, and the platform keeps it.'
+    ],
+    rewards: { cash: 7000, xp: { cicd: 60 } },
+    onStart: (w) => audit(w, 'sam (qa)', 'game', 'Sam: "Review meetings would be shorter if every PR had a URL. Not a shared staging URL. ITS OWN."'),
+    onComplete: (w) => audit(w, 'system', 'game', 'Every pull request gets a stage, every stage evaporates on schedule. "Works on my laptop" is dead.')
+  },
+  // -------------------------------------------------------- 39
+  {
+    id: 'm39-tracing',
+    index: 39,
+    title: 'Follow the trace',
+    phase: 'platform',
+    story: 'p95 latency is creeping up and everyone has a theory: the app, the network, the database, Mercury in retrograde. Averages cannot settle this — traces can. Turn on distributed tracing, follow one request across lb → api → db, and fix what the spans actually blame.',
+    objective: 'Enable tracing (MONITORING → TRACING), let it sample, and ANALYZE — identify the true bottleneck. It will be the database: fix connection churn with a pooler (pgbouncer), then wire an SLO-aware alert on the db latency metric.',
+    coaching: 'MONITORING → TRACING: ENABLE TRACING, wait for ≥10 traces, hit ANALYZE. The db span will dominate (connection churn under load). DATABASE tab → ENABLE PGBOUNCER. Then MONITORING → alert rules → new rule: db_p95_ms > 900.',
+    skills: ['observability', 'databases'],
+    requirements: [
+      { id: 'tracing-on', label: 'Distributed tracing enabled', check: (w) => Boolean(w.flags.tracingEnabled) },
+      { id: 'spans', label: 'At least 10 traces sampled', check: (w) => (w.traces?.length ?? 0) >= 10 },
+      { id: 'bottleneck', label: 'Bottleneck identified by trace analysis (the db, of course)', check: (w) => Boolean(w.flags.traceBottleneckFound) },
+      { id: 'pooler', label: 'Connection pooler enabled (pgbouncer) — the fix the trace pointed at', check: (w) => Boolean(w.db.pooler) },
+      { id: 'latency-alert', label: 'SLO-aware alert on db_p95_ms', check: (w) => w.monitoring.alertRules.some((r) => r.metric === 'db_p95_ms' && r.threshold <= 1200) }
+    ],
+    hints: [
+      'MONITORING tab → TRACING panel → ENABLE TRACING. Every 5 sim minutes one request gets sampled end-to-end: lb → api → db, one span per hop.',
+      'Once ≥10 traces exist: ANALYZE. The attribution table shows the db span owning 40%+ of request latency — connection churn, not application code. The fix: DATABASE tab → ENABLE PGBOUNCER (connection pooler in front of Postgres).',
+      'Watch the next traces: db spans shrink once the pooler fronts the database. Then make latency page someone BEFORE users notice: MONITORING → alert rules → db_p95_ms, op >, threshold 900.'
+    ],
+    rewards: { cash: 8000, xp: { observability: 60, databases: 20 } },
+    onStart: (w) => audit(w, 'maya', 'game', 'Maya: "p95 is up 40% and everyone blames their favorite subsystem. Stop theorizing — trace one request and read the spans."'),
+    onComplete: (w) => audit(w, 'system', 'game', 'The trace settled it: the database connection churn was the latency, the pooler was the fix, and the alert now watches the metric that mattered.')
+  },
+  // -------------------------------------------------------- 40
+  {
+    id: 'm40-acquisition',
+    index: 40,
+    title: 'The acquisition',
+    phase: 'platform',
+    story: 'The letter of intent is on the table. The acquirers will run due diligence across everything you built — security posture, reliability promises, unit economics, the team, the portfolio — and then the announcement will try to kill your platform with a wave of new users. Pass all five, sign, and survive the wave.',
+    objective: 'COMPANY tab → ACQUISITION: open the data room, turn every due-diligence pillar green, accept the term sheet — then hold the platform together through the announcement traffic (a scale event is armed the moment you sign).',
+    coaching: 'The data room scores five pillars, each mapped to real state (not vibes): fix red ones by revisiting the systems that own them. After signing: the announcement hits in ~45 sim minutes — keep incidents closed and error rate low through it.',
+    skills: ['architecture', 'security', 'finops'],
+    requirements: [
+      { id: 'data-room', label: 'Data room clean: all five due-diligence pillars green', check: (w) => dueDiligence(w).every((p) => p.pass) },
+      { id: 'term-sheet', label: 'Term sheet accepted (the company sold)', check: (w) => Boolean(w.endgame?.termSheetAccepted) },
+      { id: 'scale-survived', label: 'The announcement scale event survived (platform held)', check: (w) => Boolean(w.flags.scaleEventSurvived) }
+    ],
+    hints: [
+      'COMPANY tab → ACQUISITION → OPEN DATA ROOM. Five pillars: security & compliance (zero findings), reliability (SLOs + budget), FinOps (budget held), team (≥2 engineers + on-call), portfolio (≥2 products, 10% MRR share). Each red pillar names what it wants.',
+      'All green → ACCEPT TERM SHEET. The payout lands in cash and the acquirers announce the deal in ~45 sim minutes — expect a ~2× traffic wave when they do.',
+      'Through the announcement: keep incidents closed and error_pct under 2. The check re-runs every 30 sim minutes until the platform proves it holds. Survive it, and the campaign is yours.'
+    ],
+    rewards: { cash: 25000, xp: { architecture: 80, security: 40, finops: 40 } },
+    onStart: (w) => audit(w, 'board', 'game', 'BOARD: "Letter of intent signed by the acquirers. Due diligence opens now — five pillars, all of them real. Make the data room boring."'),
+    onComplete: (w) => {
+      w.flags.legendMode = true;
+      audit(w, 'system', 'game', 'P5 COMPLETE — 40 MISSIONS. ACQUIRED. The platform you built from a dead API on one box carried a company through due diligence and an announcement wave. LEGEND MODE: the world keeps happening — sandbox, challenges and packs are yours.');
     }
   }
 ];

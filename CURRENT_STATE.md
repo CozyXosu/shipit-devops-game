@@ -3,135 +3,123 @@
 Concise snapshot of the repository's working state for future coding sessions.
 Source of truth for design/roadmap: `docs/DESIGN.md`. If anything here looks stale,
 verify against the repo (`git status --short`, recent log, actual files) — never
-trust it blindly. Last updated: 2026-09-28.
+trust it blindly. Last updated: 2026-09-28 (P5 session).
 
 ## Project / Version
 
 - SHIP IT — DevOps company simulator (TypeScript backend + React web UI). Player
   runs a fictional company's infrastructure through simulated Linux/Docker/CI/
   K8s/Terraform/cloud workflows, mission by mission.
-- Version v0.3, all roadmap phases P0–P4 shipped (see `docs/DESIGN.md` §12).
-  32 missions built (m01–m32).
+- Version v0.4, roadmap P0–P5 all shipped (see `docs/DESIGN.md` §12).
+  40 missions built (m01–m40).
 - `package.json` version string still reads `0.1.0` — cosmetic, never bumped.
 
 ## Git
 
-- Branch `main`. Last game release: `47c4668` (v0.3, 32-mission game, pushed).
-- 2026-09-28 follow-up commit adds the agent workflow (`CURRENT_STATE.md`,
-  `AGENTS.md` restore) and the P5 proposal draft (`docs/P5-PROPOSAL.md`) —
-  local only, not pushed.
+- Branch `main`. Last release: `47c4668` (v0.3, 32-mission game, pushed).
+- Uncommitted local work: P5 ("Trust & Scale") implementation — missions
+  m33–m40, sims, UI, tests, docs (this session). Not committed, not pushed.
 - `data/` is gitignored: live save games are NOT in git.
 
 ## Implemented (verified)
 
 - Backend (`server/src/`): Express API (`api.ts`), entry (`index.ts`, port 4100),
-  world model (`world.ts`), tick engine (`engine.ts`), types (`types.ts`).
+  world model (`world.ts`), tick engine, types (`types.ts`).
 - Infra simulators (`server/src/sim/`): shell/fs, git, docker + registry, CI,
-  database, Kubernetes, Terraform, cloud providers (Stratus/Volt/Orbit),
-  network/DNS/firewall, monitoring, challenge mode.
-- Missions m01–m32 (`server/src/missions/missions.ts`) + mission-pack system
-  (`server/src/missions/packs.ts`, packs in `packs/`; postmortem-tournament pack).
-- Frontend (`web/src/`): React SPA — terminal, editors, cloud console, mission UI,
-  accessibility (contrast/large text/reduced motion/Alt+number tabs), EN/ES/DE chrome.
+  database, Kubernetes, Terraform, cloud (Stratus/Volt/Orbit), net/DNS/firewall,
+  monitoring, challenge mode, vault (P5).
+- Missions m01–m40 (`server/src/missions/missions.ts`) + mission-pack system
+  (`packs/`; postmortem-tournament pack).
+- P5a security arc: `sim/vault.ts` (vault CLI: put/lease/rotate/scan),
+  zero-trust mesh + STRICT mTLS (world.ts + CLOUD panel), NetworkPolicy +
+  admission Policy manifest kinds + `cosign` CLI (host.ts, k8s.ts, docker
+  signing/SBOM flags), compliance layer (live findings, access review,
+  append-only audit store, evidence bundles — COMPANY tab panel).
+- P5b platform endgame: developer portal (new PORTAL tab, golden paths,
+  ticket-queue drain), ephemeral preview environments (`ci.previews`, preview
+  step `uses: sim/preview`, URL serving in `sim/net.ts`), distributed tracing
+  (`world.traces`, MONITORING → TRACING panel, pgbouncer in DATABASE tab),
+  acquisition capstone (five-pillar due diligence, term sheet, announcement
+  scale event, legend mode — COMPANY tab panel).
+- Frontend (`web/src/`): React SPA — terminal, editors, cloud console, mission
+  UI, PORTAL tab, accessibility, EN/ES/DE chrome (portal tab localized too).
 - Storage: JSON file `data/games.json` by default; optional Postgres via
   `SHIPIT_PG_URL` behind the async `Storage` seam (`db/schema.sql`).
-- Tests: 13 vitest suites (139 tests) in `tests/` covering every sim subsystem + missions.
+- Tests: 14 vitest suites (150 tests). `tests/p5.test.ts` plays the whole
+  m33→m40 chain plus units (admission denial, vault scan, findings mapping).
 
-## In Progress
+## Save compatibility (verified this session)
 
-- P5 proposal drafted (`docs/P5-PROPOSAL.md`) — awaiting user direction; not
-  approved, not implemented.
-- User's live playthrough: save `data/games.json`, game `69a00316`
-  ("Mills Brothers"), m01–m09 completed, current mission `m10-ci` (CI).
-
-## Planned
-
-- Roadmap P0–P4 fully shipped. Next-phase candidate: `docs/P5-PROPOSAL.md`
-  (P5a security arc m33–m36, P5b platform/endgame m37–m40) — proposal only,
-  not approved.
+- Live save `69a00316` ("Mills Brothers", m10) loads, evaluates missions and
+  ticks cleanly. All new world fields are optional with defaults on read;
+  new missions only trigger after m32 completes.
 
 ## Known Bugs / Quirks
 
-- Simulated shell has NO heredoc (`<<`) support: `cat > f <<EOF` collapses into
-  plain `cat` and can write terminal error output into the target file. This
-  corrupted the in-game `.gitignore` once and stalled the live game on m08
-  (recovered in-save via EDITOR + commit).
-- m08 `env-file` check (`server/src/missions/missions.ts:294`) accepts a
-  commented-out `# DB_PASSWORD=` line (loose substring match). Quirk, not blocker.
-- Two hardening fixes were offered 2026-09-28 and NOT approved — do not
-  implement unless asked: (1) make `server/src/sim/shell.ts` reject `<<` with a
-  clear "heredocs not supported, use the EDITOR" message; (2) tighten the
-  env-file check to require an uncommented `DB_PASSWORD=` line.
+- Simulated shell has NO heredoc (`<<`) support (unchanged; two hardening
+  fixes still NOT approved — do not implement unless asked).
+- m08 env-file check accepts a commented-out `DB_PASSWORD=` line (quirk).
+- `git init -q` parses `-q` as a path (repo at `/opt/app/-q`) — sim quirk;
+  tests use plain `git init`.
+- Mission dock's "every mission complete" text still describes P4 content
+  (cosmetic; legend-mode audit line covers the P5 ending).
 
 ## Architecture Facts
 
-- The whole game is one serializable world state object (`server/src/types.ts`);
-  the tick engine advances it; all logic is pure functions over that state.
-- Missions are declarative checklists: each requirement is a `check(world)`
-  predicate — completion is derived from world state, never stored as truth.
-- When debugging "mission won't complete": read the live save from
-  `data/games.json` first — check logic is usually right; player state is usually
-  what's broken.
+- One serializable world state object; tick engine advances it; missions are
+  declarative `check(world)` predicates; completion derived, never stored.
+- New P5 state blocks (types.ts): `vault`, `zeroTrust`, `compliance`, `portal`,
+  `traces`, `endgame`, `ci.previews`, `db.pooler`, `k8s.networkPolicies`,
+  `k8s.admissionPolicy`, image `signed`/`sbom` flags — all optional.
+- Mission phases now include `trust` (m33–36) and `platform` (m37–40).
 
 ## Key Files
 
 - `server/src/index.ts` — server entry (port 4100; `npm run dev:server`)
-- `server/src/api.ts` — REST API
-- `server/src/world.ts` — domain logic (largest file; grep before reading)
-- `server/src/engine.ts` — tick loop
-- `server/src/sim/host.ts` — hosts/VMs + shell command backends (very large)
-- `server/src/missions/missions.ts` — all 32 missions
-- `web/src/views.tsx` — all UI views (large)
-- `tests/` — vitest suites; `db/schema.sql` — Postgres schema
-- `data/games.json` — live saves (gitignored)
+- `server/src/api.ts` — REST API (+ P5 endpoints: mesh, compliance, portal,
+  tracing, pooler, endgame)
+- `server/src/world.ts` — domain logic (+ P5 engine section at the end)
+- `server/src/sim/vault.ts` — secrets manager CLI (P5a)
+- `server/src/sim/k8s.ts` — + NetworkPolicy/Policy kinds, admission control
+- `server/src/missions/missions.ts` — all 40 missions
+- `web/src/views.tsx` — all UI views (+ Portal, CompliancePanel,
+  AcquisitionPanel, TracingPanel)
+- `tests/p5.test.ts` — P5 chain test; `data/games.json` — live saves
 
 ## Run / Verify
 
-- Dev: `npm run dev:server` + `npm run dev:web` (or `npm start` = build + serve).
+- Dev: `npm run dev:server` + `npm run dev:web` (or `npm start`).
 - Verify before done: `npx tsc --noEmit` (root), `cd web && npx tsc --noEmit`,
   then `npm test` (vitest).
-- Verification status: see "Current Focus" below — updated after each session's run.
 
 ## Constraints
 
-- LF line endings, `core.autocrlf=false` — never normalize or reformat unrelated files.
-- Never hand-edit `data/games.json` outside explicit save debugging (live player data).
-- GitHub pushes work as CozyXosu; personal account codyrmills28 has no write access.
+- LF line endings, `core.autocrlf=false` — never normalize or reformat
+  unrelated files.
+- Never hand-edit `data/games.json` outside explicit save debugging.
+- The two shell-hardening fixes remain unapproved (see Known Bugs).
 
 ## Current Focus
 
 ### Objective
 
-Decide the next phase. Roadmap P0–P4 is exhausted; a P5 proposal
-("Trust & Scale": security/compliance arc + platform-engineering endgame)
-is drafted in `docs/P5-PROPOSAL.md` and awaiting the user's approval and
-answers to its three open questions.
-
-### Relevant Files
-
-- `docs/P5-PROPOSAL.md` — the proposal; merge into `docs/DESIGN.md` §10/§12 on
-  approval, then implement sub-phase by sub-phase (P5a first, recommended)
-- `docs/DESIGN.md` — source of truth; §10 curriculum table, §12 roadmap
-- `data/games.json` — live save; read first when debugging mission completion
-
-### Current Problem
-
-None blocking.
+None open. P5 proposal was approved and fully implemented (both sub-phases).
+Decision record: `docs/P5-PROPOSAL.md` (status: shipped). Its three open
+questions were resolved: both sub-phases, m40 = acquisition, security gates
+the endgame via the due-diligence data room.
 
 Final Verification (2026-09-28, this session): root `tsc --noEmit` clean,
-`web/` `tsc --noEmit` clean, `npm test` 139/139 passed (13 files). Fully verified.
+`web/` `tsc --noEmit` clean, `npm test` 150/150 passed (14 files), live save
+load-tested. Fully verified.
 
 ### Expected Outcome
 
-User approves a direction → next session folds the proposal into DESIGN.md and
-starts P5a (m33–m36, `sim/vault.ts` + net/k8s/docker extensions). Any P5 work
-must keep the mid-campaign save (`69a00316`, m10) loadable: new world fields
-optional with defaults on read.
+Next session: commit/push P5 as v0.4 when the user asks; then pick from the
+deferred list (multiplayer/leaderboards, mobile/PWA, data engineering, more
+localizations) or new pitches.
 
 ### Do Not Touch
 
 - `data/games.json` — live save, gitignored
 - The two hardening fixes (see Known Bugs) — not approved by the user
-- `docs/P5-PROPOSAL.md` content beyond editing for the user's answers — it is
-  a pending decision record
 - Line endings / formatting of unrelated files

@@ -53,18 +53,20 @@ export interface GameView {
   session: { hostId: string; user: string; cwd: string; pending: boolean; prompt: string };
   git: { branch: string; commits: number; dirty: number; pushed: boolean; conflicts: string[] } | null;
   docker: {
-    images: { tag: string; sizeMB: number; user: string; healthcheck: boolean; layers: number }[];
+    images: { tag: string; sizeMB: number; user: string; healthcheck: boolean; layers: number; signed: boolean; sbom: boolean }[];
     containers: { name: string; image: string; status: string; healthy: boolean; port: number | null }[];
-    registry: { tag: string; sizeMB: number }[];
+    registry: { tag: string; sizeMB: number; signed: boolean; sbom: boolean }[];
   };
   ci: {
     runs: { id: string; startedAtMin: number; pipelinePath: string; commitSha: string; status: string; image?: string; stages: { name: string; status: string; log: string[] }[] }[];
     deployments: { id: string; service: string; image: string; createdAtMin: number; source: string; active: boolean }[];
     staging: { image: string | null; e2ePassed: boolean; e2eLog: string[] } | null;
+    previews: { id: string; image: string; url: string; createdAtMin: number; minutesLeft: number }[];
+    previewsDestroyed: number;
   };
   db: {
     provisioned: boolean; plan: string; endpoint: string; cpu: number; connections: number;
-    migrationsDone: boolean; tables: { name: string; rows: number; indexes: string[] }[];
+    migrationsDone: boolean; pooler: boolean; tables: { name: string; rows: number; indexes: string[] }[];
     backups: {
       enabled: boolean; retentionDays: number;
       snapshots: { atMin: number; label: string; ordersRows: number }[];
@@ -78,6 +80,8 @@ export interface GameView {
     services: { name: string; type: string; port: number; targetPort: number; selector: string; ingressIp: string | null }[];
     ingresses: { name: string; host: string; service: string }[];
     hpas: { name: string; deployment: string; min: number; max: number; current: number; peaked: boolean }[];
+    networkPolicies: { name: string; defaultDeny: boolean; allows: { fromSelector: string; port: number }[] }[];
+    admissionPolicy: { name: string; rule: string } | null;
   };
   tf: null | {
     initialized: boolean; managed: number; addresses: string[];
@@ -155,6 +159,35 @@ export interface GameView {
   registryTags: string[];
   agentInstalled: boolean;
   diskPct: number;
+  // ---- P5a: trust ----
+  vault: null | {
+    enabled: boolean; credsLive: boolean;
+    secrets: { path: string; rotations: number; leases: number; lastRotatedAtMin: number }[];
+    leakDetected: boolean; leakRevoked: boolean;
+  };
+  zeroTrust: null | { meshInstalled: boolean; mtlsStrict: boolean; identities: string[] };
+  compliance: {
+    auditImmutable: boolean; bundlesCount: number;
+    lastBundle: { atMin: number; checks: { id: string; label: string; ok: boolean }[] } | null;
+    findings: { id: string; label: string; severity: string; detail: string }[];
+    users: { name: string; sudo: boolean; groups: string[] }[];
+  };
+  // ---- P5b: platform ----
+  portal: null | {
+    enabled: boolean;
+    templates: { id: string; name: string; description: string; published: boolean }[];
+    ticketQueue: number; devDeploys: number;
+    deployLog: { atMin: number; dev: string; service: string }[];
+  };
+  tracing: {
+    enabled: boolean; bottleneckFound: boolean; dbP95: number;
+    traces: { id: string; atMin: number; path: string; durationMs: number; spans: { service: string; operation: string; durationMs: number }[] }[];
+  };
+  endgame: {
+    pillars: { id: string; label: string; pass: boolean; detail: string }[];
+    termSheetAccepted: boolean; payout: number | null;
+    scaleEventSurvived: boolean; legendMode: boolean;
+  };
 }
 
 async function j<T>(res: Response): Promise<T> {
@@ -237,7 +270,28 @@ export const api = {
     fetch(`/api/games/${id}/finops/budget`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ monthly }) }).then((r) => j<{ ok: boolean; message: string }>(r)),
   finopsReserve: (id: string) => fetch(`/api/games/${id}/finops/reserve`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r)),
   k8sNodes: (id: string, count: number) =>
-    fetch(`/api/games/${id}/k8s/nodes`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ count }) }).then((r) => j<{ ok: boolean; message: string }>(r))
+    fetch(`/api/games/${id}/k8s/nodes`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ count }) }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  // ---- P5 ----
+  cloudMesh: (id: string, action: 'install' | 'strict') =>
+    fetch(`/api/games/${id}/cloud/mesh`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action }) }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  complianceEvidence: (id: string) =>
+    fetch(`/api/games/${id}/compliance/evidence`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  complianceAccess: (id: string, user: string) =>
+    fetch(`/api/games/${id}/compliance/access`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user }) }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  complianceAuditlog: (id: string) =>
+    fetch(`/api/games/${id}/compliance/auditlog`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  portalEnable: (id: string) =>
+    fetch(`/api/games/${id}/portal/enable`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  portalPublish: (id: string, templateId: string) =>
+    fetch(`/api/games/${id}/portal/templates/${templateId}/publish`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  tracingEnable: (id: string) =>
+    fetch(`/api/games/${id}/tracing/enable`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  tracingAnalyze: (id: string) =>
+    fetch(`/api/games/${id}/tracing/analyze`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string; attribution: { service: string; sharePct: number; avgMs: number }[] }>(r)),
+  dbPooler: (id: string) =>
+    fetch(`/api/games/${id}/db/pooler`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  endgameAccept: (id: string) =>
+    fetch(`/api/games/${id}/endgame/accept`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r))
 };
 
 export interface FsEntry { name: string; type: string; sizeMB: number; owner: string; mode: string; children?: FsEntry[] }

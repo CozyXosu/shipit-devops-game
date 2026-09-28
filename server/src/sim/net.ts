@@ -182,6 +182,17 @@ export function httpRequest(world: World, rawUrl: string, opts: { headOnly?: boo
     return { ok: true, status: 200, statusText: 'OK', headers: ['Server: registry/2.0'], body: '{}', timeMs: 15 };
   }
 
+  // ephemeral preview environments (P5b): pr-N.preview.<slug>.dev
+  if (hostname.endsWith('.preview.' + world.company.slug + '.dev')) {
+    const preview = (world.ci.previews ?? []).find((p) => p.url === hostname);
+    if (!preview) {
+      return { ok: true, status: 404, statusText: 'Not Found', headers: ['Server: preview-gw'], body: '<html><body><h1>404: no such preview environment</h1></body></html>', timeMs: 6 };
+    }
+    const res = appResponse(world, path, world.hosts['web-01']);
+    if (res.ok && res.headers) res.headers = ['Server: preview-gw', `X-Preview: ${preview.id}`, `X-Preview-Image: ${preview.image}`, ...res.headers];
+    return res;
+  }
+
   const resolved = resolveHostname(world, hostname);
   if (resolved.kind === 'nxdomain') return { ok: false, error: resolved.error, timeMs: 12 };
 
