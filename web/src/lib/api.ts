@@ -6,6 +6,18 @@ export interface GameSummary { id: string; name: string; day: number; updatedAt:
 
 export interface ReqResult { id: string; label: string; pass: boolean }
 
+export interface SolveStep { kind: 'cmd' | 'write' | 'action' | 'wait' | 'note'; label: string; detail?: string; output?: string; minutes?: number }
+
+export interface SolveResult {
+  ok: boolean;
+  missionId: string;
+  missionTitle: string;
+  completed: boolean;
+  steps: SolveStep[];
+  requirements: ReqResult[];
+  message?: string;
+}
+
 export interface GameView {
   id: string;
   day: number;
@@ -209,6 +221,7 @@ export const api = {
   writeFile: (id: string, path: string, content: string) =>
     fetch(`/api/games/${id}/file`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, content }) }).then((r) => j<{ ok: boolean; warnings: string[] }>(r)),
   hint: (id: string, pack = false) => fetch(`/api/games/${id}/mission/hint`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pack }) }).then((r) => j<{ hint: string | null; index: number; remaining: number }>(r)),
+  solve: (id: string, pack = false) => fetch(`/api/games/${id}/mission/solve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pack }) }).then((r) => j<SolveResult>(r)),
   listPacks: () => fetch('/api/packs').then((r) => j<GameView['packs']['available']>(r)),
   activatePack: (id: string, packId: string) => fetch(`/api/games/${id}/packs/${packId}/activate`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r)),
   challengeStart: (id: string, challengeId: string) =>

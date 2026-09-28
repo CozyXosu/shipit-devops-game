@@ -3,7 +3,7 @@
 Concise snapshot of the repository's working state for future coding sessions.
 Source of truth for design/roadmap: `docs/DESIGN.md`. If anything here looks stale,
 verify against the repo (`git status --short`, recent log, actual files) — never
-trust it blindly. Last updated: 2026-09-28 (P5 session).
+trust it blindly. Last updated: 2026-09-28 (auto-solve committed & pushed).
 
 ## Project / Version
 
@@ -17,7 +17,8 @@ trust it blindly. Last updated: 2026-09-28 (P5 session).
 ## Git
 
 - Branch `main`. Last release: `05e8c02` (v0.4, 40-mission game, pushed to
-  github.com/CozyXosu/shipit-devops-game). Working tree clean.
+  github.com/CozyXosu/shipit-devops-game). Auto-solve feature committed on
+  top and pushed (solvers.ts, api.ts, web/, tests); working tree clean.
 - History: `47c4668` (v0.3, P1–P4) → `b034a6f` (agent workflow + P5 proposal)
   → `05e8c02` (v0.4, P5).
 - `data/` is gitignored: live save games are NOT in git.
@@ -31,6 +32,20 @@ trust it blindly. Last updated: 2026-09-28 (P5 session).
   monitoring, challenge mode, vault (P5).
 - Missions m01–m40 (`server/src/missions/missions.ts`) + mission-pack system
   (`packs/`; postmortem-tournament pack).
+- **Auto-solve** (`server/src/missions/solvers.ts`): an executable canonical
+  walkthrough for every mission (career m01–m40 + tournament pmr-01…05).
+  `POST /api/games/:id/mission/solve` (`{pack?}`) plays the current mission's
+  solution with requirement guards (only missing pieces run), returns a step
+  transcript (cmd/write/action/wait/note) the UI shows next to the Hint button
+  (`⚡ Solve it for me`, EN/ES/DE chrome). Endpoint pauses the sim clock while
+  solving so the 1s tick loop can't interleave. Unknown/custom pack missions
+  decline gracefully (`ok:false`). Notable solver logic: m07 resolves the merge
+  conflict from the HEAD side (explicit `git add config.js` clears the unmerged
+  state — `git add -A` does not); pmr-02/pmr-04 restart their round when the
+  MTTR window is poisoned by an overlapping ambient incident or provider
+  outage (errors pinned at 80% block resolution); m40 re-commits an honest SLO
+  target when the 99.5% budget was burned by provider outages (uptimeBadMin
+  decays only 1/240 per good minute — waiting it out is not viable).
 - P5a security arc: `sim/vault.ts` (vault CLI: put/lease/rotate/scan),
   zero-trust mesh + STRICT mTLS (world.ts + CLOUD panel), NetworkPolicy +
   admission Policy manifest kinds + `cosign` CLI (host.ts, k8s.ts, docker
@@ -46,8 +61,10 @@ trust it blindly. Last updated: 2026-09-28 (P5 session).
   UI, PORTAL tab, accessibility, EN/ES/DE chrome (portal tab localized too).
 - Storage: JSON file `data/games.json` by default; optional Postgres via
   `SHIPIT_PG_URL` behind the async `Storage` seam (`db/schema.sql`).
-- Tests: 14 vitest suites (150 tests). `tests/p5.test.ts` plays the whole
+- Tests: 15 vitest suites (159 tests). `tests/p5.test.ts` plays the whole
   m33→m40 chain plus units (admission denial, vault scan, findings mapping).
+  `tests/solve.test.ts` auto-solves the entire m01→m40 career chain plus the
+  tournament pack track mission-by-mission (~0.5s wall clock).
 
 ## Save compatibility (verified this session)
 
@@ -83,9 +100,11 @@ trust it blindly. Last updated: 2026-09-28 (P5 session).
 - `server/src/sim/vault.ts` — secrets manager CLI (P5a)
 - `server/src/sim/k8s.ts` — + NetworkPolicy/Policy kinds, admission control
 - `server/src/missions/missions.ts` — all 40 missions
+- `server/src/missions/solvers.ts` — auto-solve walkthroughs + transcript types
 - `web/src/views.tsx` — all UI views (+ Portal, CompliancePanel,
   AcquisitionPanel, TracingPanel)
-- `tests/p5.test.ts` — P5 chain test; `data/games.json` — live saves
+- `tests/solve.test.ts` — auto-solve chain test; `tests/p5.test.ts` — P5 chain
+  test; `data/games.json` — live saves
 
 ## Run / Verify
 
@@ -104,14 +123,15 @@ trust it blindly. Last updated: 2026-09-28 (P5 session).
 
 ### Objective
 
-None open. P5 proposal was approved and fully implemented (both sub-phases).
-Decision record: `docs/P5-PROPOSAL.md` (status: shipped). Its three open
-questions were resolved: both sub-phases, m40 = acquisition, security gates
-the endgame via the due-diligence data room.
+Auto-solve feature shipped, committed and pushed to `main`: a `⚡ Solve it for me`
+button on every career mission and the tournament pack track. Each click plays
+the mission's canonical solution server-side and shows a step-by-step
+transcript of what it did. Verified: root/web `tsc --noEmit` clean, `npm test`
+159/159 (15 files, incl. the full auto-solve chain test), live HTTP smoke test
+(create → solve m01/m02 → graceful pack fallback → delete), live save
+untouched.
 
-Final Verification (2026-09-28, this session): root `tsc --noEmit` clean,
-`web/` `tsc --noEmit` clean, `npm test` 150/150 passed (14 files), live save
-load-tested. Fully verified. Committed as `05e8c02` and pushed to origin/main.
+Prior state: P5 fully shipped and released as v0.4 (`05e8c02`, pushed).
 
 ### Expected Outcome
 

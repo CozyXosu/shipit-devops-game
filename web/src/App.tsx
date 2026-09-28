@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, GameSummary, GameView } from './lib/api';
+import { api, GameSummary, GameView, SolveResult } from './lib/api';
 import { isLocale, Locale, makeT } from './lib/i18n';
 import { Terminal, Editor, Dashboard, CiView, DbView, Monitoring, Cloud, Costs, Postmortems, K8sView, Company, Modes, Portal } from './views';
 
@@ -338,10 +338,53 @@ function MissionDock({ view, t, game, onOpen }: { view: GameView; t: (key: strin
   );
 }
 
-function MissionBody({ view, full, onOpen }: { view: GameView; t: (key: string) => string; full?: boolean; onOpen?: () => void; game?: string }) {
+/** The auto-solve transcript: everything the walkthrough did, step by step. */
+function SolveTranscript({ r, t }: { r: SolveResult; t: (key: string) => string }) {
+  return (
+    <div className="hintbox" style={{ marginTop: 8 }}>
+      <b>{r.completed ? '✅' : '⚠️'} {t(r.completed ? 'solve.done' : 'solve.incomplete')} — {r.missionTitle} · {r.steps.length} {t('solve.steps')}</b>
+      {r.message ? <div style={{ marginTop: 2 }}>{r.message}</div> : null}
+      <ol style={{ margin: '8px 0 0', paddingLeft: 18, lineHeight: 1.65 }}>
+        {r.steps.map((s, i) => (
+          <li key={i}>
+            {s.kind === 'cmd' ? (
+              <><code>{s.detail}</code>{s.output ? <span className="dimtxt"> — {s.output.split('\n')[0].slice(0, 110)}</span> : null}</>
+            ) : s.kind === 'write' ? (
+              <>{s.label} <code>{s.detail}</code></>
+            ) : s.kind === 'wait' ? (
+              <>{s.label} <span className="dimtxt">(+{s.minutes} sim min)</span></>
+            ) : s.kind === 'action' ? (
+              <>{s.label}{s.output ? <span className="dimtxt"> — {s.output.slice(0, 110)}</span> : null}</>
+            ) : (
+              <>{s.label}</>
+            )}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+function useSolver(gameId: string, pack: boolean) {
+  const [solving, setSolving] = useState(false);
+  const [result, setResult] = useState<SolveResult | null>(null);
+  const solve = async () => {
+    setSolving(true);
+    try {
+      setResult(await api.solve(gameId, pack));
+    } catch (e) {
+      setResult({ ok: false, missionId: '', missionTitle: '', completed: false, steps: [], requirements: [], message: String(e) });
+    }
+    setSolving(false);
+  };
+  return { solving, result, solve };
+}
+
+function MissionBody({ view, t, full, onOpen }: { view: GameView; t: (key: string) => string; full?: boolean; onOpen?: () => void; game?: string }) {
   const m = view.missions.current;
   const [hint, setHint] = useState<string | null>(null);
   const [hintMeta, setHintMeta] = useState<{ index: number; remaining: number } | null>(null);
+  const solver = useSolver(view.id, false);
 
   useEffect(() => { setHint(null); setHintMeta(null); }, [m?.id]);
 
@@ -394,9 +437,11 @@ function MissionBody({ view, full, onOpen }: { view: GameView; t: (key: string) 
 
       <div className="row" style={{ marginTop: 12 }}>
         <button onClick={askHint}>💡 Hint ({m.hintsUsed}/{m.hintsTotal})</button>
+        <button onClick={solver.solve} disabled={solver.solving}>{solver.solving ? t('dock.solving') : t('dock.solve')}</button>
       </div>
       {hint && <div className="hintbox">HINT {hintMeta?.index}: {hint}</div>}
       {hintMeta?.remaining === 0 && <div className="dimtxt" style={{ marginTop: 4 }}>That was the last hint level.</div>}
+      {solver.result && <SolveTranscript r={solver.result} t={t} />}
 
       {view.missions.summaries.length > 0 && (
         <div className="mlist">
@@ -417,6 +462,7 @@ function PackBody({ view, t, game }: { view: GameView; t: (key: string) => strin
   const pm = view.missions.pack;
   const [hint, setHint] = useState<string | null>(null);
   const [hintMeta, setHintMeta] = useState<{ index: number; remaining: number } | null>(null);
+  const solver = useSolver(view.id, true);
 
   useEffect(() => { setHint(null); setHintMeta(null); }, [pm?.id]);
 
@@ -445,8 +491,10 @@ function PackBody({ view, t, game }: { view: GameView; t: (key: string) => strin
       </div>
       <div className="row" style={{ marginTop: 10 }}>
         <button onClick={askHint}>💡 {t('dock.hint')} ({pm.hintsUsed}/{pm.hintsTotal})</button>
+        <button onClick={solver.solve} disabled={solver.solving}>{solver.solving ? t('dock.solving') : t('dock.solve')}</button>
       </div>
       {hint && <div className="hintbox">HINT {hintMeta?.index}: {hint}</div>}
+      {solver.result && <SolveTranscript r={solver.result} t={t} />}
     </div>
   );
 }

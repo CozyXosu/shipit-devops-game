@@ -46,7 +46,9 @@ const EN: Dict = {
   'modes.access.on': 'ON', 'modes.access.off': 'OFF',
   'modes.access.note': 'Keyboard: Alt+1…9 switches tabs, Alt+0 opens MODES. Terminal and audit feed announce updates to screen readers.',
   'modes.gated': 'Unlocks after mission 28 — or anywhere in sandbox.',
-  'dock.hint': 'Hint', 'dock.pack': 'PACK MISSION', 'dock.noHints': 'No more hints — you are on your own, engineer.'
+  'dock.hint': 'Hint', 'dock.pack': 'PACK MISSION', 'dock.noHints': 'No more hints — you are on your own, engineer.',
+  'dock.solve': '⚡ Solve it for me', 'dock.solving': '⚡ Solving…',
+  'solve.done': 'AUTO-SOLVED', 'solve.incomplete': 'AUTO-SOLVE INCOMPLETE', 'solve.steps': 'steps', 'solve.whatItDid': 'what it did'
 };
 
 const ES: Dict = {
@@ -79,7 +81,9 @@ const ES: Dict = {
   'modes.access.on': 'SÍ', 'modes.access.off': 'NO',
   'modes.access.note': 'Teclado: Alt+1…9 cambia de pestaña, Alt+0 abre MODOS. El terminal y el feed anuncian cambios a lectores de pantalla.',
   'modes.gated': 'Se desbloquea tras la misión 28 — o siempre en sandbox.',
-  'dock.hint': 'Pista', 'dock.pack': 'MISIÓN DE PACK', 'dock.noHints': 'No quedan pistas — estás solo, ingeniero/a.'
+  'dock.hint': 'Pista', 'dock.pack': 'MISIÓN DE PACK', 'dock.noHints': 'No quedan pistas — estás solo, ingeniero/a.',
+  'dock.solve': '⚡ Resuélvela por mí', 'dock.solving': '⚡ Resolviendo…',
+  'solve.done': 'AUTO-RESUELTA', 'solve.incomplete': 'AUTO-RESOLUCIÓN INCOMPLETA', 'solve.steps': 'pasos', 'solve.whatItDid': 'lo que hizo'
 };
 
 const DE: Dict = {
@@ -112,7 +116,9 @@ const DE: Dict = {
   'modes.access.on': 'AN', 'modes.access.off': 'AUS',
   'modes.access.note': 'Tastatur: Alt+1…9 wechselt Tabs, Alt+0 öffnet MODI. Terminal und Audit-Feed melden Updates an Screenreader.',
   'modes.gated': 'Schaltet nach Mission 28 frei — oder jederzeit im Sandbox.',
-  'dock.hint': 'Tipp', 'dock.pack': 'PAKET-MISSION', 'dock.noHints': 'Keine Tipps mehr — du bist auf dich gestellt.'
+  'dock.hint': 'Tipp', 'dock.pack': 'PAKET-MISSION', 'dock.noHints': 'Keine Tipps mehr — du bist auf dich gestellt.',
+  'dock.solve': '⚡ Löse sie für mich', 'dock.solving': '⚡ Löse…',
+  'solve.done': 'AUTO-GELÖST', 'solve.incomplete': 'AUTO-LÖSUNG UNVOLLSTÄNDIG', 'solve.steps': 'Schritte', 'solve.whatItDid': 'was getan wurde'
 };
 
 const DICT: Record<Locale, Dict> = { en: EN, es: ES, de: DE };

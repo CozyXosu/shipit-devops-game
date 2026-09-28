@@ -13,6 +13,7 @@ import { CHALLENGES, challengeOf, challengeStars } from './sim/challenges';
 import { getFile, writeFile, resolvePath, getNode, listDir, nodeSizeMB } from './sim/fs';
 import { currentMission, currentPackMission, evalRequirements, evaluateMissions, takeHint, fillTemplate, commandsRun, allMissionSummaries } from './engine';
 import { availablePacks, activatePack, currentPackMissionOf, getPack, packMissionsOf } from './missions/packs';
+import { solveMission, SolveResult } from './missions/solvers';
 import { status as gitStatus } from './sim/git';
 import { complianceFindings, collectEvidence, enableAuditStore, revokeSudo, installMesh, setMtlsStrict, enablePortal, publishTemplate, enableTracing, analyzeTraces, enablePooler, dueDiligence, acceptTermSheet } from './world';
 import { randomUUID } from 'crypto';
@@ -122,6 +123,27 @@ export function createApi(storage: Storage): Router {
     const result = takeHint(state, Boolean(req.body?.pack));
     await storage.save(state);
     res.json(result ?? { hint: null, index: -1, remaining: 0 });
+  });
+
+  // ---- auto-solve: play the canonical walkthrough for the current mission ----
+  api.post('/games/:id/mission/solve', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    // pause the sim clock while solving so the 1s tick loop cannot interleave
+    // its own load/tick/save against this (longer-running) request
+    const wasPaused = Boolean(state.world.flags.paused);
+    state.world.flags.paused = true;
+    await storage.save(state);
+    let result: SolveResult;
+    try {
+      result = solveMission(state, { pack: Boolean(req.body?.pack) });
+    } catch (e) {
+      result = { ok: false, missionId: '', missionTitle: '', completed: false, steps: [], requirements: [], message: `solve failed: ${String(e)}` };
+    } finally {
+      state.world.flags.paused = wasPaused;
+    }
+    await storage.save(state);
+    res.json(result);
   });
 
   // ---- CI ----

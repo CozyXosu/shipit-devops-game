@@ -1,12 +1,12 @@
 # SHIP IT — DevOps Simulator
 
-## 1. Purpose
+## 1. Mission
 
 TypeScript vertical slice for a hands-on DevOps simulator.
 
-Primary goal:
+Goal:
 
-> Complete requested work correctly while using the minimum files, tools, output, and context required.
+> Complete the requested task correctly with the fewest necessary files, tool calls, output, and context.
 
 Sources of truth:
 
@@ -15,21 +15,64 @@ Sources of truth:
 * `docs/DESIGN.md` — intended design and roadmap.
 * Source code and tests — actual implementation.
 
-When sources disagree, verify against code.
+When documentation conflicts with code, verify code.
 
 ---
 
-# 2. Start Here
+# 2. Execution Communication
+
+Minimize agent-generated text during work.
+
+Use tools directly when the next action is clear.
+
+Do NOT narrate:
+
+* routine searches;
+* routine reads;
+* routine edits;
+* routine tests;
+* obvious next steps;
+* findings already established;
+* file contents already visible.
+
+Do NOT produce a thought/summary before every tool call.
+
+Prefer:
+
+```text
+tool → tool → tool → result
+```
+
+over:
+
+```text
+explanation → tool → explanation → tool → explanation → tool
+```
+
+Batch related independent operations when practical.
+
+Only stop to explain when:
+
+* a decision is ambiguous;
+* destructive/irreversible action needs confirmation;
+* new evidence changes the plan;
+* a failure requires a new debugging strategy.
+
+Final response should be concise.
+
+---
+
+# 3. Start
 
 For every task:
 
 1. Read `CURRENT_STATE.md`.
 2. Run `git status --short`.
 3. Identify the smallest relevant file set.
-4. Read only what is required.
-5. Implement the smallest correct solution.
+4. Inspect only required code/tests.
+5. Implement.
 6. Run focused verification.
-7. Run full verification once stable.
+7. Run final verification once stable.
 8. Update `CURRENT_STATE.md` if meaningful.
 9. Stop.
 
@@ -37,78 +80,120 @@ Do not explore the repository before knowing what information is needed.
 
 ---
 
-# 3. Context Is Expensive
+# 4. Context Is Expensive
 
-Minimize context growth.
+Treat context as a limited engineering resource.
 
-### File access
+Every read, search, command, test, and generated explanation must have a reason.
+
+## Files
 
 * Prefer targeted search over broad exploration.
 * Prefer line ranges over full-file reads.
 * Read only relevant sections.
-* Do not read entire large files when a symbol or line range is sufficient.
 * Do not reread unchanged content.
-* Reuse information already present in context.
-* After editing a file, inspect only the changed/relevant section when possible.
-* Do not inspect unrelated files.
+* Reuse information already in context.
+* After editing, inspect only the affected section when possible.
+* Never read unrelated files.
 
-### Search
+## Search
 
-* Search for the exact symbol, error, route, function, type, or behavior needed.
-* Start narrow.
-* Expand only when evidence requires it.
-* Do not recursively inspect the repository without a specific reason.
-* Do not repeat searches that already answered the question.
+Start narrow:
 
-### Output
+* exact symbol;
+* exact error;
+* exact function;
+* exact type;
+* exact route;
+* exact behavior.
 
-Keep tool output small.
+Expand only when evidence requires it.
+
+Do not perform repository-wide searches without a specific reason.
+
+Do not repeat a search that already answered the question.
+
+## Output
+
+Keep output bounded.
 
 Avoid:
 
-* full file dumps
-* full repository diffs
-* unrestricted logs
-* huge grep results
-* lockfiles
-* generated files
-* build output
-* repeated test output
-* directory dumps
+* full files;
+* full repository diffs;
+* unrestricted logs;
+* huge grep results;
+* lockfiles;
+* generated files;
+* build directories;
+* repeated test output;
+* directory dumps.
 
 Prefer:
 
-* `git status --short`
-* targeted `git diff -- path`
-* targeted search
-* focused test output
-* relevant log lines
+* `git status --short`;
+* targeted `git diff -- path`;
+* targeted searches;
+* focused tests;
+* relevant log lines.
 
-### Conversation
+## Conversation
 
-Do not waste context on narration.
+Do not duplicate information.
 
 * No routine progress reports.
-* No explaining obvious tool calls.
+* No long summaries of tool results.
 * No repeating known facts.
-* No long summaries of files just read.
-* Do not paste code that already exists in the repository.
-* Do not describe every change individually unless needed.
+* No pasting repository code into chat.
+* No explaining every edit.
 * State each fact once.
 
 ---
 
-# 4. Skills
+# 5. Stop Exploring
+
+Stop exploration when:
+
+* relevant implementation is identified;
+* requested behavior is understood;
+* an existing test/example provides the required pattern;
+* the next code change is clear.
+
+Do not inspect additional subsystems "just in case."
+
+Discover dependencies only when implementation or verification requires them.
+
+If existing tests already demonstrate the required behavior, use them as the primary implementation reference.
+
+---
+
+# 6. Existing Tests Are Implementation References
+
+Before implementing behavior that already exists in tests:
+
+1. Find the relevant test.
+2. Identify the proven command/API sequence.
+3. Reuse existing APIs and patterns.
+4. Implement from that evidence.
+5. Inspect internals only when the test is insufficient.
+
+Do not independently rediscover behavior already demonstrated by tests.
+
+Tests can be treated as executable examples, not just verification.
+
+---
+
+# 7. Skills
 
 Installed skills:
 
-* `ponytail` — minimal implementation and YAGNI.
+* `ponytail` — minimal implementation / YAGNI.
 * `caveman` — compressed communication.
 * `rtk` — reduced CLI output.
 
-Use them as intended.
+Use them together.
 
-### Ponytail
+## Ponytail
 
 For coding tasks:
 
@@ -119,13 +204,13 @@ For coding tasks:
 * Avoid unnecessary dependencies.
 * Avoid unrelated refactors.
 * Modify the fewest files possible.
-* Fix root causes, not symptoms.
+* Fix root causes.
 
-Do not sacrifice correctness to reduce code.
+Do not sacrifice correctness for a smaller diff.
 
-### Caveman
+## Caveman
 
-Use compressed communication during agent work.
+Use compressed communication during work.
 
 * No filler.
 * No routine narration.
@@ -133,50 +218,26 @@ Use compressed communication during agent work.
 * Exact technical terms.
 * Preserve commands, code, API names, and errors.
 * Never omit `not`, `never`, `no`, `only`, or `except`.
-* Prioritize clarity for security, destructive, or ambiguous operations.
 
-Do not compress repository code or exact error messages.
+Prioritize clarity for security, destructive, or ambiguous operations.
 
-### RTK
+## RTK
 
 Write normal shell commands.
 
 Do not manually prefix commands with `rtk` when the RTK bridge handles them.
 
-Use raw output only when exact output is required for diagnosis.
+Use raw output only when exact output is required.
 
 ---
 
-# 5. Exploration Budget
-
-Start with the smallest possible scope.
-
-Typical initial target:
-
-* `CURRENT_STATE.md`
-* relevant source files
-* relevant tests
-
-Do not impose arbitrary repository-wide reading.
-
-Expand only when:
-
-* the implementation references another required component;
-* a test reveals another dependency;
-* the root cause cannot be determined;
-* the requested behavior crosses a subsystem boundary.
-
-Stop exploring once enough information exists to implement safely.
-
----
-
-# 6. Scope Control
+# 8. Scope
 
 Solve the requested problem.
 
-For a bug:
+For bugs:
 
-1. Reproduce or locate root cause.
+1. Locate root cause.
 2. Fix root cause.
 3. Verify.
 4. Stop.
@@ -189,16 +250,15 @@ Do not automatically:
 * upgrade dependencies;
 * improve unrelated UI;
 * clean unrelated files;
-* rewrite working systems;
-* fix unrelated warnings.
-
-If another issue is discovered, leave it alone unless it blocks the requested task.
+* rewrite working systems.
 
 No "while I'm here" work.
 
+If another issue is discovered, leave it alone unless it blocks the requested task.
+
 ---
 
-# 7. Research Before Editing
+# 9. Research Before Editing
 
 Do not edit blindly.
 
@@ -206,31 +266,32 @@ Before changing code:
 
 1. Understand requested behavior.
 2. Locate relevant implementation.
-3. Trace the necessary flow.
-4. Check existing patterns.
-5. Check relevant tests.
-6. Identify root cause.
-7. Implement the smallest correct change.
+3. Trace only the necessary flow.
+4. Check existing patterns/tests.
+5. Determine root cause.
+6. Implement.
 
-Do not continue researching after the implementation path is clear.
+Stop researching when implementation is clear.
 
-Before modifying shared code, inspect its relevant callers.
+Before changing shared code, inspect relevant callers.
+
+Do not inspect every caller when the function is local and its usage is already understood.
 
 ---
 
-# 8. Implementation
+# 10. Implementation
 
 Use the smallest correct implementation.
 
-Prefer:
+Preference order:
 
 1. Existing code.
-2. Existing project utilities.
+2. Existing utilities.
 3. Existing types.
 4. Standard library.
 5. Native platform features.
 6. Existing dependencies.
-7. New code only when necessary.
+7. New code.
 
 Avoid:
 
@@ -243,17 +304,87 @@ Avoid:
 * boilerplate;
 * whole-file rewrites.
 
-Preserve existing APIs unless the task requires a change.
+Preserve existing APIs unless required.
 
 Preserve unrelated formatting.
 
 ---
 
-# 9. Testing
+# 11. Edit Safety
 
-Do not repeatedly run expensive verification after every small edit.
+Prefer small, deterministic edits.
 
-During development:
+* Prefer targeted edits over whole-file rewrites.
+* Avoid large heredocs for complex files.
+* Avoid shell-generated rewrites when a targeted edit works.
+* Do not make many speculative edits before checking syntax.
+* After a risky edit, verify only the affected region.
+* Do not reread the entire file after a small edit.
+
+If an edit fails:
+
+1. Inspect the affected region.
+2. Fix the immediate problem.
+3. Continue.
+4. Do not restart broad exploration.
+
+---
+
+# 12. Debugging
+
+Debug from evidence.
+
+When something fails:
+
+1. Read the exact failure.
+2. Locate the relevant code.
+3. Inspect the smallest state needed.
+4. Form one likely cause.
+5. Test that cause.
+6. Fix.
+7. Re-run the smallest relevant check.
+
+Do not investigate unrelated hypothetical failures.
+
+Do not reread the entire subsystem.
+
+Do not restart repository discovery after a local failure.
+
+When debugging reveals the cause, stop investigating alternatives.
+
+---
+
+# 13. Tool Call Efficiency
+
+Minimize unnecessary tool calls.
+
+Prefer:
+
+```text
+search → targeted read → edit → test
+```
+
+Avoid:
+
+```text
+search → summarize → search again → reread → summarize → search again
+```
+
+Batch independent searches/reads when practical.
+
+Do not call a tool to confirm information already established by a previous result.
+
+Do not run commands whose output cannot change the next decision.
+
+---
+
+# 14. Testing
+
+Use focused verification during development.
+
+Do not run expensive full verification after every edit.
+
+During implementation:
 
 * Run the smallest relevant test/check.
 * Fix failures before continuing.
@@ -273,17 +404,17 @@ All must pass before declaring the task fully verified.
 
 If a check fails:
 
-1. Determine whether the current change caused it.
+1. Determine whether current changes caused it.
 2. Fix if within scope.
 3. Run the smallest relevant check.
 4. Repeat final verification when stable.
 5. Record unresolved in-scope failures in `CURRENT_STATE.md`.
 
-Do not dump full test output into the response.
+Do not paste full test output into the response.
 
 ---
 
-# 10. Git Safety
+# 15. Git Safety
 
 Always begin with:
 
@@ -291,23 +422,21 @@ Always begin with:
 git status --short
 ```
 
-The repository may contain user work.
+Repository may contain user work.
 
-Never:
+Never use these to discard work unless explicitly instructed:
 
-* discard user changes;
-* use `git reset --hard`;
-* use `git clean`;
-* use `git checkout -- <file>`;
-* overwrite unrelated changes.
+* `git reset --hard`;
+* `git clean`;
+* `git checkout -- <file>`.
 
-Before editing a file with existing changes, inspect the relevant diff.
+Before modifying a file with existing user changes, inspect the relevant diff.
 
 Do not create commits unless explicitly requested.
 
 ---
 
-# 11. Line Endings
+# 16. Line Endings
 
 Repository uses:
 
@@ -319,13 +448,15 @@ Files use LF.
 
 Preserve LF.
 
-Do not normalize line endings or reformat unrelated files.
+Do not normalize line endings.
+
+Do not reformat unrelated files.
 
 ---
 
-# 12. Project Structure
+# 17. Project Layout
 
-Relevant layout:
+Current major areas:
 
 ```text
 server/src/
@@ -342,17 +473,21 @@ db/
 docs/
 ```
 
-Do not assume this list is complete. Search when needed.
+This is not an exhaustive file list.
+
+Search when needed.
+
+Do not inspect directories merely to learn their contents.
 
 ---
 
-# 13. Current State
+# 18. Current State
 
-`CURRENT_STATE.md` exists to prevent repeated project discovery.
+`CURRENT_STATE.md` prevents repeated project discovery.
 
-Keep it short and useful.
+Keep it short.
 
-Record only:
+Record:
 
 * current focus;
 * active bugs;
@@ -364,21 +499,17 @@ Record only:
 
 Remove stale information.
 
-Do not use it as a diary.
+Do not maintain a task diary.
 
-Do not put:
+Do not copy `AGENTS.md` or `docs/DESIGN.md`.
 
-* source code;
-* large logs;
-* full diffs;
-* repeated design documentation;
-* historical task narration.
+Do not store source code, large logs, or full diffs.
 
-Update it after meaningful work.
+Update after meaningful work.
 
 ---
 
-# 14. Design
+# 19. Design
 
 `docs/DESIGN.md` defines intended game design and roadmap.
 
@@ -386,12 +517,12 @@ Read it when the task concerns:
 
 * missions;
 * progression;
-* game design;
 * roadmap;
+* game design;
 * intended player behavior;
 * requirements defined there.
 
-Do not read the entire design document for unrelated implementation tasks.
+Do not read the entire document for unrelated implementation work.
 
 Known baseline may be stale:
 
@@ -399,81 +530,77 @@ Known baseline may be stale:
 * P1–P4 shipped;
 * v0.2 / 16-mission slice.
 
-Verify current state when relevant.
+Verify current code when relevant.
 
 Mission work must preserve variety.
 
-Do not create repetitive mission structures when extending the mission system.
+Avoid repetitive mission structures.
 
 ---
 
-# 15. Architecture
+# 20. Architecture
 
-Backend owns authoritative simulation and game state.
+Backend owns authoritative simulation/game state.
 
 Frontend consumes backend/API state.
 
 Do not move responsibilities between layers unless required.
 
-Before creating a:
+Before creating a manager, service, utility, factory, interface, state store, or abstraction:
 
-* manager;
-* service;
-* utility;
-* state store;
-* factory;
-* interface;
-* abstraction;
-
-search for an existing equivalent.
+1. Search for an existing equivalent.
+2. Reuse it if suitable.
+3. Create a new one only if required.
 
 Do not create duplicate systems.
 
 ---
 
-# 16. Context-Saving Workflow
+# 21. Large Tasks
 
-Use this loop:
+Break large tasks into bounded phases.
 
-```text
-State
-→ Scope
-→ Targeted inspect
-→ Implement
-→ Focused verify
-→ Final verify
-→ State update
-→ Stop
-```
-
-Do not use this loop:
+For each phase:
 
 ```text
-Explore everything
-→ read everything
-→ summarize everything
-→ modify
-→ reread everything
-→ test everything
-→ explore again
-→ refactor unrelated code
+inspect → implement → focused verify
 ```
 
-When the requested task is complete, stop.
+Do not continuously expand the scope.
+
+After each successful phase:
+
+* retain only relevant context;
+* do not repeat completed exploration;
+* continue from known state.
+
+If a phase is complete, move on.
+
+Do not restart earlier phases unless new evidence requires it.
 
 ---
-## Edit Safety
 
-Prefer small, deterministic edits.
+# 22. Context Growth Control
 
-- Do not use large heredocs or shell-generated file rewrites for complex changes.
-- Prefer targeted file edits.
-- After a risky edit, verify only the affected region.
-- Do not make multiple speculative edits before checking syntax.
-- Avoid whole-file replacement when a targeted edit works.
+When context begins growing rapidly:
 
+* stop unnecessary exploration;
+* stop repeating summaries;
+* stop rereading files;
+* use targeted reads;
+* use focused commands;
+* finish the current scope;
+* avoid optional improvements.
 
-# 17. Completion
+Do not add work merely because context is available.
+
+The objective is not maximum investigation.
+
+The objective is a correct completed task.
+
+---
+
+# 23. Completion
 
 Task is complete when:
 
@@ -485,15 +612,15 @@ Task is complete when:
 * meaningful state changes are recorded;
 * no known in-scope error remains.
 
-Do not claim verification that was not performed.
+Do not claim checks that were not run.
 
-Do not continue searching for additional work.
+Do not continue after completion.
 
 ---
 
-# 18. Final Response
+# 24. Final Response
 
-Keep final responses minimal.
+Keep final response minimal.
 
 Use:
 
@@ -510,7 +637,7 @@ Remaining:
 - ...
 ```
 
-If nothing remains, omit `Remaining`.
+Omit `Remaining` when empty.
 
 Do not:
 
@@ -519,8 +646,8 @@ Do not:
 * repeat the task;
 * explain every tool call;
 * provide an essay;
-* report internal reasoning.
+* provide internal reasoning.
 
 Goal:
 
-> Maximum useful work with minimum context consumption.
+> Maximum useful work. Minimum context.
