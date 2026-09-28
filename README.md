@@ -43,7 +43,9 @@ Requires Node 18+ (`node` on PATH).
 - **BUILD (missions 1–20):** SSH & Linux forensics → systemd → permissions →
   nginx reverse proxy → DNS → git (with a real merge conflict) → secrets →
   Docker (validated Dockerfile) → CI/CD pipeline → managed Postgres →
-  monitoring → **INCIDENT: disk full** → **INCIDENT: bad deploy** →
+  monitoring — **fog of war**: no telemetry exists before you install the
+  agent, so outages surface as customer tickets instead of alerts →
+  **INCIDENT: disk full** → **INCIDENT: bad deploy** →
   DB saturation under 6× traffic (EXPLAIN + index) → **HA: second VM + load
   balancer + chaos failover drill** → staging + e2e + **approval-gated deploys**
   → **Terraform** (import, plan, drift, apply) → **Kubernetes** (Deployment
@@ -89,6 +91,13 @@ Requires Node 18+ (`node` on PATH).
 
 ## Built for learning, not for trivia
 
+- **Fog of war.** The world simulates everything, but you only see what
+  instrumentation has seen. Until the observability agent is installed the
+  dashboards are empty, alert rules cannot exist, and an outage is detected
+  by *customers* — after ~40 sim-minutes of undetected damage, with support
+  tickets as the only breadcrumbs. The manual channel (ssh, `df`, `journalctl`,
+  vendor consoles for the managed DB and cloud volume) always works; installing
+  the agent buys *continuous* sight, starting at install time (no backfill).
 - **Lessons, free, before every authoring task.** The 13 file-authoring
   missions (nginx conf, Dockerfile, pipeline YAML, K8s manifests, HCL,
   NetworkPolicies, …) ship with a collapsible 📘 lesson in the mission dock:

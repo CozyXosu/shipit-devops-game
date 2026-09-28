@@ -50,6 +50,19 @@ the loop and unlocks the next problem.
 Failure is content: broken YAML produces CrashLoopBackOff-style symptoms to
 debug, not "wrong answer".
 
+**Fog of war (observability):** the loop above presumes you can OBSERVE — so
+observation itself is a mechanic. The world simulates everything, but the
+view-model exposes only what instrumentation has seen: `metricsView` gates
+telemetry on the observability agent (collection starts at install, no
+backfill), alert rules require a data source, and an emergent incident that
+begins while you are blind is detected by customers after
+`BLIND_DETECT_MIN` (40) sim minutes — `detectedBy: "customer report"` plus a
+timeline note about the undetected window, versus instant alert-driven
+detection once the agent runs. Support-ticket "signal" events drip into the
+audit feed while blind. Manual channels stay open by design (terminal,
+managed-DB provider console, cloud volume stats): automation buys
+*continuous* sight, not truth.
+
 ## 3. Technology Stack
 
 | Layer | Choice | Rationale |

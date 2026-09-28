@@ -12,7 +12,8 @@ trust it blindly. Last updated: 2026-09-28 (real-world curriculum layer + polish
   K8s/Terraform/cloud workflows, mission by mission.
 - Version v0.4, roadmap P0–P5 all shipped (see `docs/DESIGN.md` §12).
   40 missions built (m01–m40).
-- `package.json` version reads `0.4.1` (bumped 2026-09-28 from the stale 0.1.0).
+- `package.json` version reads `0.4.2` (bumped 2026-09-28 for the fog-of-war
+  pass; 0.4.1 was the learning-coverage pass).
 
 ## Git
 
@@ -58,6 +59,25 @@ trust it blindly. Last updated: 2026-09-28 (real-world curriculum layer + polish
   safe against false requirement passes: every sim parser skips `#` comments
   except nginx (regex over raw text) and the logrotate flag check, whose two
   starters therefore use prose-only TODOs.
+- **Fog of war (uncommitted, 2026-09-28)**: observability is now a mechanic —
+  the world simulates everything but the view-model only exposes what the
+  observability agent has seen. `metricsView(world)` in `world.ts` gates
+  `metrics.latest/series` on `agentInstalled` and cuts series at
+  `monitoring.agentInstalledAtMin` (new optional field, stamped at install —
+  legacy saves without it default to full visibility). `addAlertRule` returns
+  `null` pre-agent (API answers 400; UI locks the form). Emergent incidents
+  (disk_full, bad_deploy) opened while blind are detected by customers after
+  `BLIND_DETECT_MIN` (40) sim minutes via `observeOutage()` — resets if the
+  condition clears undetected — with `detectedBy: "customer report — no
+  monitoring installed"`, a blind-window timeline note, and periodic
+  `kind: 'signal'` customer-ticket breadcrumbs in the audit feed
+  (`emitBlindSignals`, every 12 min while errorPct ≥ 5). Staged incidents
+  (`openIncidentOfKind`, tournament/packs) intentionally bypass the delay.
+  UI: Dashboard fog banner + "—" metric cards, Monitoring no-agent panel +
+  locked alert form, CLOUD install-agent copy. m12 story/objective/hints
+  teach the mechanic. Vendor consoles stay visible by design (managed DB,
+  cloud volume, LB health). Tests: `tests/fog.test.ts` (9 tests, incl. legacy
+  save compat); 17 suites / 170 tests total.
 - **Real-world curriculum layer** (`REAL_WORLD` in missions.ts + UI): every
   career mission m01–m40 carries a one-to-two-sentence "In a real job" note
   (transferable skill + real tool names, `{domain}` templates filled). Exposed
@@ -86,10 +106,13 @@ trust it blindly. Last updated: 2026-09-28 (real-world curriculum layer + polish
   has a starter scaffold.
 - Storage: JSON file `data/games.json` by default; optional Postgres via
   `SHIPIT_PG_URL` behind the async `Storage` seam (`db/schema.sql`).
-- Tests: 16 vitest suites (161 tests). `tests/p5.test.ts` plays the whole
+- Tests: 17 vitest suites (170 tests). `tests/p5.test.ts` plays the whole
   m33→m40 chain plus units (admission denial, vault scan, findings mapping).
   `tests/solve.test.ts` auto-solves the entire m01→m40 career chain plus the
   tournament pack track mission-by-mission (~0.5s wall clock).
+  `tests/fog.test.ts` covers the observability fog (telemetry gate, alert
+  gate, blind-vs-monitored incident detection, blind-window reset, legacy
+  save compat).
 
 ## Save compatibility (verified this session)
 
@@ -149,27 +172,28 @@ trust it blindly. Last updated: 2026-09-28 (real-world curriculum layer + polish
 
 ### Objective
 
-Learning-coverage pass shipped on top of `main` (uncommitted): a real-world
-mapping note on every career mission ("In a real job": transferable skill +
-real tool names), the curriculum map + honest gap list in
-`docs/CURRICULUM.md`, and polish (dock completion text now covers P5,
-`package.json` → 0.4.1). Verified: root/web `tsc --noEmit` clean, `npm test`
-161/161 (incl. new `tests/realworld.test.ts` coverage guard), live HTTP smoke
-on the restarted :4100 server (realWorld in view-model; smoke game deleted;
-two pre-existing stray "test" games left alone). User's dev server on :4100
-was killed and restarted with current code; `web/dist` rebuilt so the static
-UI served there includes the new dock block.
+Fog-of-war pass shipped on top of `main` (uncommitted): observability as a
+game mechanic — telemetry invisible before the agent (collection starts at
+install, no backfill), alert rules require a data source, emergent incidents
+that begin while blind are detected by customers ~40 sim-minutes late with
+customer-ticket signals in the audit feed, and Dashboard/Monitoring/CLOUD UI
+that explains the fog instead of lying. m12 copy teaches it. Verified: root
+and web `tsc --noEmit` clean, `npm test` 170/170 (incl. new
+`tests/fog.test.ts`), live save `a284f63d` (m01) loads + ticks with fog
+applied (read-only smoke — save untouched). `web/dist` rebuilt so the static
+UI on :4100 includes the fog views.
 
-Prior state: lesson system + editor hand-holding committed as `a3956fc`,
-README refresh `acf2d6d`; v0.4 released (`05e8c02`).
+Prior state: learning-coverage pass (realWorld notes + curriculum map) and
+lesson system (`a3956fc`) on top of v0.4 (`05e8c02`).
 
 ### Expected Outcome
 
-Commit the learning-coverage pass when the user is happy with it. Next
-content direction: pick from the deferred list (multiplayer/leaderboards,
-mobile/PWA, data engineering, more localizations) or close curriculum gaps
-from `docs/CURRICULUM.md` as new missions (caching, queues, load testing,
-GitOps, feature flags — would each need a small sim engine).
+Commit the fog-of-war pass when the user is happy with it. Next content
+direction: pick from the deferred list (multiplayer/leaderboards, mobile/PWA,
+data engineering, more localizations), close curriculum gaps from
+`docs/CURRICULUM.md`, or extend the fog: engineer-minutes action economy
+(automation buys back time) and a security adversary were the other
+game-mechanic candidates from the 2026-09-28 brainstorm.
 
 ### Do Not Touch
 

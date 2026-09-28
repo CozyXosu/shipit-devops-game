@@ -54,6 +54,7 @@ export interface GameView {
     } | null;
   };
   metrics: {
+    fog: boolean;
     latest: Record<string, number>;
     series: Record<string, number[]>;
   };

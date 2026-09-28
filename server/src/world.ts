@@ -572,16 +572,18 @@ function tickOne(world: World): void {
     }
   }
 
-  // emergent incident triggers
-  if (diskUsagePct(world) >= 99.5 && !world.monitoring.incidents.some((i) => i.kind === 'disk_full')) {
+  // emergent incident triggers — fog of war: without the agent, incidents are
+  // detected by customers, not by alerts, and customers are slow
+  if (observeOutage(world, 'disk', diskUsagePct(world) >= 99.5 && !world.monitoring.incidents.some((i) => i.kind === 'disk_full'))) {
     openDiskFullIncident(world);
   }
   if (world.flags.badDeployBug) {
-    if (world.flags.badDeployAtMin === undefined) world.flags.badDeployAtMin = world.nowMin + 3;
+    if (world.flags.badDeployAtMin === undefined) world.flags.badDeployAtMin = world.nowMin + (world.monitoring.agentInstalled ? 3 : BLIND_DETECT_MIN);
     else if (world.nowMin >= num(world.flags.badDeployAtMin) && !world.monitoring.incidents.some((i) => i.kind === 'bad_deploy')) {
       openBadDeployIncident(world, world.app.image ?? 'unknown');
     }
   }
+  emitBlindSignals(world, errorPct);
 
   // incident resolution checks
   for (const inc of world.monitoring.incidents.filter((x) => x.status === 'open')) {
@@ -646,18 +648,21 @@ export function latest(world: World, metric: string): number | null {
 export function openDiskFullIncident(world: World): void {
   if (world.flags.logrotateConfigured) return;
   if (world.monitoring.incidents.some((i) => i.kind === 'disk_full' && i.status === 'open')) return;
+  const blind = !world.monitoring.agentInstalled;
   const inc: Incident = {
     id: 'inc-disk-' + Math.floor(world.nowMin % 100000),
     kind: 'disk_full',
     title: 'Uploads failing & API intermittently returning 500s',
-    symptom: 'Customer report (ticket #4412): "Uploads fail with an unknown error, and the dashboard is flaky." Error rate climbing.',
+    symptom: blind
+      ? 'Customer report (ticket #4412): "Uploads fail with an unknown error, and the dashboard is flaky." No alert ever fired — there was no monitoring to fire one.'
+      : 'Disk-usage alert firing. Uploads fail with an unknown error, and the dashboard is flaky. Error rate climbing.',
     severity: 'SEV2',
     openedAtMin: world.nowMin,
     status: 'open',
     rootCause: 'Application logs grow without rotation; / filled to 100% and the API hit ENOSPC.',
     customerImpact: 'Uploads fail; intermittent 5xx for all dashboard users while disk is full.',
-    detectedBy: 'customer report + metrics',
-    timeline: [],
+    detectedBy: blind ? 'customer report — no monitoring installed' : 'disk/error alerts (monitoring agent)',
+    timeline: blind ? [{ t: world.nowMin, actor: 'system', text: `Impact began earlier — the disk filled ~${BLIND_DETECT_MIN} sim minutes before anyone noticed (no alerting installed)` }] : [],
     corrective: [
       { id: 'rotate', label: 'Configure logrotate for /var/log/app.log', done: false },
       { id: 'diskalert', label: 'Add a disk-usage alert (>85%)', done: false },
@@ -672,18 +677,21 @@ export function openDiskFullIncident(world: World): void {
 
 export function openBadDeployIncident(world: World, image: string): void {
   if (world.monitoring.incidents.some((i) => i.kind === 'bad_deploy' && i.status === 'open')) return;
+  const blind = !world.monitoring.agentInstalled;
   const inc: Incident = {
     id: 'inc-deploy-' + Math.floor(world.nowMin % 100000),
     kind: 'bad_deploy',
     title: `Error rate spike after deploying ${image}`,
-    symptom: 'Error rate jumped minutes after the release. Customers see failed order lookups.',
+    symptom: blind
+      ? 'Customers report failed order lookups. It took complaints to notice — the regression has been live for a while.'
+      : 'Error-rate alert fired minutes after the release. Customers see failed order lookups.',
     severity: 'SEV1',
     openedAtMin: world.nowMin,
     status: 'open',
     rootCause: 'Regression shipped in the release: the orders endpoint issues an unindexed query under load.',
     customerImpact: 'Order lookups fail or time out for a large share of users.',
-    detectedBy: 'error-rate alert / metrics',
-    timeline: [],
+    detectedBy: blind ? 'customer report — no monitoring installed' : 'error-rate alert (monitoring agent)',
+    timeline: blind ? [{ t: world.nowMin, actor: 'system', text: `Impact began earlier — the bad release ran ~${BLIND_DETECT_MIN} sim minutes before detection (no alerting installed)` }] : [],
     corrective: [
       { id: 'rollback', label: 'Roll back to the previous release', done: false },
       { id: 'erralert', label: 'Have an error-rate alert (>2%)', done: false },
@@ -843,7 +851,81 @@ export function resizeDisk(world: World, gb: number): void {
 export function installMonitoringAgent(world: World): void {
   if (world.monitoring.agentInstalled) return;
   world.monitoring.agentInstalled = true;
-  audit(world, world.session.user, 'monitoring', 'Observability agent installed on web-01 (metrics flowing)');
+  world.monitoring.agentInstalledAtMin ??= world.nowMin;
+  audit(world, world.session.user, 'monitoring', 'Observability agent installed on web-01 — telemetry starts flowing NOW (nothing before this moment was ever collected)');
+}
+
+// ------------------------------------------------------------------
+// Fog of war: the world simulates everything, but the player only sees
+// what instrumentation has seen. Without the agent, dashboards are empty,
+// alert rules cannot exist, and outages are detected by customers —
+// slowly. Manual channels (terminal, provider consoles) stay open:
+// automation is what buys continuous sight.
+// ------------------------------------------------------------------
+/** Sim minutes a customer-visible outage smolders undetected without monitoring. */
+export const BLIND_DETECT_MIN = 40;
+
+/**
+ * Fog gate for emergent incident detection. Returns true when `condition`
+ * has been continuously true long enough to be *detected*: instantly with
+ * the observability agent (alerts page you), after customer reports without
+ * it. Resets if the condition clears before anyone notices.
+ */
+function observeOutage(world: World, key: string, condition: boolean): boolean {
+  const flag = `blind_${key}SinceMin`;
+  if (!condition) {
+    if (world.flags[flag] !== undefined) delete world.flags[flag];
+    return false;
+  }
+  if (world.monitoring.agentInstalled) return true;
+  if (world.flags[flag] === undefined) {
+    world.flags[flag] = world.nowMin;
+    return false;
+  }
+  return world.nowMin - num(world.flags[flag]) >= BLIND_DETECT_MIN;
+}
+
+const BLIND_SIGNALS = [
+  'support ticket #4412: "checkout spins forever then fails — is it just me?"',
+  'tweet: "hey @{slug} your site is throwing errors???"',
+  'refund requests ticking up in the payments inbox',
+  'customer email: "order lookups keep timing out, we are switching vendors"',
+  'app-store-style review drops to 2 stars: "broken all morning"'
+];
+
+/** While blind, degradation reaches the player only as customer noise — vague and delayed. */
+function emitBlindSignals(world: World, errorPct: number): void {
+  if (!world.company.launched || world.monitoring.agentInstalled || errorPct < 5) return;
+  if (world.nowMin % 12 !== 0) return;
+  const text = BLIND_SIGNALS[Math.floor(world.nowMin / 12) % BLIND_SIGNALS.length].replace('{slug}', world.company.slug);
+  audit(world, 'customer', 'signal', text);
+}
+
+/** The monitoring view-model: what the player may see of the metrics truth. */
+export function metricsView(world: World): { fog: boolean; latest: Record<string, number>; series: Record<string, number[]> } {
+  if (!world.monitoring.agentInstalled) return { fog: true, latest: {}, series: {} };
+  const since = world.monitoring.agentInstalledAtMin ?? 0;
+  const visible = (k: string) => (world.monitoring.series[k] ?? []).filter((p) => p.t >= since);
+  const latestOf = (k: string) => {
+    const v = visible(k);
+    return v.length ? v[v.length - 1].v : 0;
+  };
+  return {
+    fog: false,
+    latest: {
+      req_rate: latestOf('req_rate'), error_pct: latestOf('error_pct'), p95_ms: latestOf('p95_ms'),
+      cpu_pct: latestOf('cpu_pct'), mem_pct: latestOf('mem_pct'), db_cpu_pct: latestOf('db_cpu_pct'),
+      disk_pct: Math.round(diskUsagePct(world) * 10) / 10, users: latestOf('users')
+    },
+    series: {
+      cpu_pct: visible('cpu_pct').slice(-120).map((p) => p.v),
+      error_pct: visible('error_pct').slice(-120).map((p) => p.v),
+      req_rate: visible('req_rate').slice(-90).map((p) => p.v),
+      p95_ms: visible('p95_ms').slice(-90).map((p) => p.v),
+      db_cpu_pct: visible('db_cpu_pct').slice(-120).map((p) => p.v),
+      disk_pct: visible('disk_pct').slice(-200).map((p) => p.v)
+    }
+  };
 }
 
 // ------------------------------------------------------------------
@@ -960,7 +1042,11 @@ export function restoreBackup(world: World): { ok: boolean; message: string } {
   return { ok: true, message: `restored ${usable.label} — ${usable.ordersRows.toLocaleString()} order rows` };
 }
 
-export function addAlertRule(world: World, metric: string, op: AlertRule['op'], threshold: number, forMinutes = 5): AlertRule {
+export function addAlertRule(world: World, metric: string, op: AlertRule['op'], threshold: number, forMinutes = 5): AlertRule | null {
+  if (!world.monitoring.agentInstalled) {
+    audit(world, world.session.user, 'monitoring', 'Alert rule rejected — no data source. Install the observability agent first: you cannot alert on data you do not collect.');
+    return null;
+  }
   const labels: Record<string, string> = {
     error_pct: 'Error rate', cpu_pct: 'CPU', db_cpu_pct: 'Database CPU', p95_ms: 'P95 latency',
     disk_pct: 'Disk usage', mem_pct: 'Memory', req_rate: 'Request rate'

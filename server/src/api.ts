@@ -2,7 +2,7 @@
 import { Router, Request, Response } from 'express';
 import { GameState, OutLine } from './types';
 import { Storage } from './state';
-import { createWorld, tick, audit, costLineItems, monthlyInfraCost, uptimePct, addDnsRecord, allowPort, provisionDb, resizeDb, runMigrations, resizeDisk, installMonitoringAgent, addAlertRule, removeAlertRule, filePostmortem, latest, diskUsagePct, provisionVm, deployToVm, provisionLb, haReady, provisionK8sCluster, enableBackups, restoreBackup, hireEngineer, fireEngineer, setOnCall, runMarketingCampaign, startRefactorProject, configureSlos, sloReport, promoteCanary, abortCanary, ensureDebt, ensureTeam, ensureSlos, payrollOf, ROLE_INFO, runCloudComparison, claimSlcCredit, startMigration, decommissionVm, ensureProducts, startProduct, productBlockers, productMrrOf, baseMrrOf, ensureFinops, setFinopsBudget, reserveCompute, finopsRecommendations, startChallenge, abandonChallenge, challengeLive, setPlayerSettings } from './world';
+import { createWorld, tick, audit, costLineItems, monthlyInfraCost, uptimePct, addDnsRecord, allowPort, provisionDb, resizeDb, runMigrations, resizeDisk, installMonitoringAgent, addAlertRule, removeAlertRule, filePostmortem, metricsView, diskUsagePct, provisionVm, deployToVm, provisionLb, haReady, provisionK8sCluster, enableBackups, restoreBackup, hireEngineer, fireEngineer, setOnCall, runMarketingCampaign, startRefactorProject, configureSlos, sloReport, promoteCanary, abortCanary, ensureDebt, ensureTeam, ensureSlos, payrollOf, ROLE_INFO, runCloudComparison, claimSlcCredit, startMigration, decommissionVm, ensureProducts, startProduct, productBlockers, productMrrOf, baseMrrOf, ensureFinops, setFinopsBudget, reserveCompute, finopsRecommendations, startChallenge, abandonChallenge, challengeLive, setPlayerSettings } from './world';
 import { runTerminalInput } from './sim/host';
 import { resolveHostname, parseNginxSites, lbBackends, hostServesApi } from './sim/net';
 import { runPipeline, rollback, approveRun } from './sim/ci';
@@ -597,6 +597,7 @@ export function createApi(storage: Storage): Router {
     if (!state) return res.status(404).json({ error: 'game not found' });
     const { metric, op, threshold } = req.body ?? {};
     const rule = addAlertRule(state.world, String(metric ?? 'error_pct'), op ?? '>', Number(threshold ?? 2));
+    if (!rule) return res.status(400).json({ error: 'no data source — install the observability agent (CLOUD tab) first' });
     evaluateMissions(state);
     await storage.save(state);
     res.json({ ok: true, rule });
@@ -650,8 +651,7 @@ export function createApi(storage: Storage): Router {
   function view(state: GameState) {
     const w = state.world;
     const m = currentMission(state);
-    const latestOf = (k: string) => latest(w, k) ?? 0;
-    const tail = (k: string, n = 120) => (w.monitoring.series[k] ?? []).slice(-n).map((p) => p.v);
+    const mv = metricsView(w);
     const nginxUp = w.hosts['web-01'].services['nginx']?.state === 'active';
     const apiSvc = w.hosts['web-01'].services['api'];
     const repo = w.git['/opt/app'];
@@ -774,17 +774,7 @@ export function createApi(storage: Storage): Router {
           };
         })()
       },
-      metrics: {
-        latest: {
-          req_rate: latestOf('req_rate'), error_pct: latestOf('error_pct'), p95_ms: latestOf('p95_ms'),
-          cpu_pct: latestOf('cpu_pct'), mem_pct: latestOf('mem_pct'), db_cpu_pct: latestOf('db_cpu_pct'),
-          disk_pct: Math.round(diskUsagePct(w) * 10) / 10, users: latestOf('users')
-        },
-        series: {
-          cpu_pct: tail('cpu_pct'), error_pct: tail('error_pct'), req_rate: tail('req_rate', 90),
-          p95_ms: tail('p95_ms', 90), db_cpu_pct: tail('db_cpu_pct'), disk_pct: tail('disk_pct', 200)
-        }
-      },
+      metrics: mv,
       alerts: w.monitoring.alertRules,
       incidents: w.monitoring.incidents,
       openIncident,
@@ -1006,7 +996,7 @@ export function createApi(storage: Storage): Router {
       tracing: {
         enabled: Boolean(w.flags.tracingEnabled),
         bottleneckFound: Boolean(w.flags.traceBottleneckFound),
-        dbP95: latestOf('db_p95_ms'),
+        dbP95: mv.latest.db_p95_ms ?? 0,
         traces: (w.traces ?? []).slice(-8).reverse().map((t) => ({ id: t.id, atMin: t.atMin, path: t.path, durationMs: t.durationMs, spans: t.spans }))
       },
       endgame: (() => {

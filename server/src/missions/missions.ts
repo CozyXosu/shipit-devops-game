@@ -419,9 +419,9 @@ export const MISSIONS: MissionDef[] = [
     index: 12,
     title: "If you can't measure it…",
     phase: 'build',
-    story: 'Users exist now. The first outage report should come from YOU, not from a customer. Install the observability agent and define what "bad" means before it happens.',
-    objective: 'Install the monitoring agent (CLOUD console), then create at least two alert rules in the MONITORING tab: error rate > 2% and one capacity signal (CPU, memory or disk).',
-    coaching: 'CLOUD → Observability agent → Install. MONITORING → Alert rules → add: error_pct > 2, and cpu_pct > 85 (or disk_pct > 85). Alerts evaluate every simulated minute.',
+    story: 'Users exist now. Notice anything odd? Your dashboards are empty and no alert has ever fired — nothing is collecting telemetry. The first outage report should come from YOU, not from a customer. Install the observability agent and define what "bad" means before it happens.',
+    objective: 'Install the monitoring agent (CLOUD console — collection starts at install, history does not backfill), then create at least two alert rules in the MONITORING tab: error rate > 2% and one capacity signal (CPU, memory or disk).',
+    coaching: 'CLOUD → Observability agent → Install. MONITORING → Alert rules → add: error_pct > 2, and cpu_pct > 85 (or disk_pct > 85). Alerts evaluate every simulated minute. Until the agent ran, the world kept breaking without telling you — customer tickets in the audit feed were the only signal.',
     skills: ['observability'],
     requirements: [
       { id: 'agent', label: 'Observability agent installed', check: (w) => w.monitoring.agentInstalled },
@@ -429,8 +429,8 @@ export const MISSIONS: MissionDef[] = [
       { id: 'cap-alert', label: 'Alert rule: a capacity signal (cpu/mem/disk ≤ 90)', check: (w) => w.monitoring.alertRules.some((r) => ['cpu_pct', 'mem_pct', 'disk_pct'].includes(r.metric) && r.threshold <= 90) }
     ],
     hints: [
-      'CLOUD tab → Observability → INSTALL AGENT. Metrics appear in MONITORING instantly.',
-      'MONITORING tab → Alert rules → New rule: metric error_pct, op >, threshold 2.',
+      'CLOUD tab → Observability → INSTALL AGENT. Charts start filling from the moment of install — nothing before it was ever collected.',
+      'MONITORING tab → Alert rules → New rule: metric error_pct, op >, threshold 2. (The form stays locked until the agent exists — you cannot alert on data you do not collect.)',
       'Second rule: metric cpu_pct, op >, threshold 85. Watch the sparklines — they are live.'
     ],
     rewards: { cash: 2500, xp: { observability: 60 } },

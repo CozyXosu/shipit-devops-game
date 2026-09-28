@@ -729,6 +729,8 @@ export interface World {
   ci: { runs: CiRun[]; deployments: Deployment[]; staging?: StagingEnv; canary?: CanaryState; blueGreen?: { activeImage: string; warmImage: string }; previews?: PreviewEnv[] };
   monitoring: {
     agentInstalled: boolean;
+    /** sim minute the agent first reported — telemetry before this is invisible (fog of war) */
+    agentInstalledAtMin?: number;
     series: Record<string, MetricPoint[]>;
     alertRules: AlertRule[];
     incidents: Incident[];

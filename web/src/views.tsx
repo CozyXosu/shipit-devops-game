@@ -299,16 +299,28 @@ export function Dashboard({ view }: { view: GameView }) {
 
   const m = view.metrics.latest;
   const s = view.metrics.series;
+  const fog = !view.agentInstalled;
 
   return (
     <div>
+      {fog && (
+        <div className="panel" style={{ borderLeft: '4px solid #e3b341', marginBottom: 14 }}>
+          <h2>Flying blind <span className="hintInline">no observability agent installed</span></h2>
+          <div className="dimtxt">
+            These dashboards are empty because nothing is collecting telemetry — the world does not
+            stop happening just because you cannot see it. Install the agent in the CLOUD tab to start
+            collecting metrics from <b>now</b> on. Until then, outages reach you as customer tickets,
+            not as alerts. You can still inspect the host directly: <code>df -h</code>, <code>systemctl status</code>, <code>journalctl</code>.
+          </div>
+        </div>
+      )}
       <div className="grid3" style={{ marginBottom: 14 }}>
-        <MetricCard label="Req/s" value={m.req_rate ?? 0} series={s.req_rate} />
-        <MetricCard label="Error %" value={m.error_pct ?? 0} unit="%" series={s.error_pct} warnAt={2} badAt={5} color="#f4635e" />
-        <MetricCard label="P95 latency" value={m.p95_ms ?? 0} unit="ms" series={s.p95_ms} warnAt={400} badAt={1200} />
-        <MetricCard label="CPU" value={m.cpu_pct ?? 0} unit="%" series={s.cpu_pct} warnAt={70} badAt={90} color="#e3b341" />
-        <MetricCard label="Disk" value={m.disk_pct ?? 0} unit="%" series={s.disk_pct} warnAt={80} badAt={92} color="#f0883e" />
-        <MetricCard label={view.db.provisioned ? 'DB CPU' : 'DB (sqlite)'} value={view.db.provisioned ? (m.db_cpu_pct ?? 0) : 'local file'} unit={view.db.provisioned ? '%' : ''} series={s.db_cpu_pct} warnAt={75} badAt={90} color="#bc8cff" />
+        <MetricCard label="Req/s" value={fog ? '—' : (m.req_rate ?? 0)} series={fog ? undefined : s.req_rate} />
+        <MetricCard label="Error %" value={fog ? '—' : (m.error_pct ?? 0)} unit="%" series={fog ? undefined : s.error_pct} warnAt={2} badAt={5} color="#f4635e" />
+        <MetricCard label="P95 latency" value={fog ? '—' : (m.p95_ms ?? 0)} unit="ms" series={fog ? undefined : s.p95_ms} warnAt={400} badAt={1200} />
+        <MetricCard label="CPU" value={fog ? '—' : (m.cpu_pct ?? 0)} unit="%" series={fog ? undefined : s.cpu_pct} warnAt={70} badAt={90} color="#e3b341" />
+        <MetricCard label="Disk" value={fog ? '—' : (m.disk_pct ?? 0)} unit="%" series={fog ? undefined : s.disk_pct} warnAt={80} badAt={92} color="#f0883e" />
+        <MetricCard label={view.db.provisioned ? 'DB CPU' : 'DB (sqlite)'} value={fog ? '—' : (view.db.provisioned ? (m.db_cpu_pct ?? 0) : 'local file')} unit={view.db.provisioned ? '%' : ''} series={fog ? undefined : s.db_cpu_pct} warnAt={75} badAt={90} color="#bc8cff" />
       </div>
 
       <div className="panel">
@@ -682,9 +694,14 @@ export function Monitoring({ game, view, refresh }: { game: string; view: GameVi
   return (
     <div>
       {!view.agentInstalled ? (
-        <div className="panel">
+        <div className="panel" style={{ borderLeft: '4px solid #e3b341' }}>
           <h2>No observability agent</h2>
-          <div className="dimtxt">Install the agent in the CLOUD tab to start collecting metrics from web-01.</div>
+          <div className="dimtxt">
+            These charts are empty because nothing is collecting telemetry — install the agent in the
+            CLOUD tab to start collecting metrics from <b>now</b> on (history before install does not
+            exist). Without it you are the last to know: outages surface as customer tickets after
+            minutes of damage instead of as alerts after seconds.
+          </div>
         </div>
       ) : null}
 
@@ -744,20 +761,24 @@ export function Monitoring({ game, view, refresh }: { game: string; view: GameVi
 
       <div className="panel">
         <h2>Alert rules</h2>
-        <div className="row">
-          <select value={metric} onChange={(e) => setMetric(e.target.value)}>
-            <option value="error_pct">error_pct</option>
-            <option value="cpu_pct">cpu_pct</option>
-            <option value="mem_pct">mem_pct</option>
-            <option value="disk_pct">disk_pct</option>
-            <option value="db_cpu_pct">db_cpu_pct</option>
-            <option value="p95_ms">p95_ms</option>
-            <option value="db_p95_ms">db_p95_ms</option>
-          </select>
-          <span>&gt;</span>
-          <input value={threshold} onChange={(e) => setThreshold(e.target.value)} style={{ width: 80 }} />
-          <button className="primary" onClick={add}>+ ADD RULE</button>
-        </div>
+        {view.agentInstalled ? (
+          <div className="row">
+            <select value={metric} onChange={(e) => setMetric(e.target.value)}>
+              <option value="error_pct">error_pct</option>
+              <option value="cpu_pct">cpu_pct</option>
+              <option value="mem_pct">mem_pct</option>
+              <option value="disk_pct">disk_pct</option>
+              <option value="db_cpu_pct">db_cpu_pct</option>
+              <option value="p95_ms">p95_ms</option>
+              <option value="db_p95_ms">db_p95_ms</option>
+            </select>
+            <span>&gt;</span>
+            <input value={threshold} onChange={(e) => setThreshold(e.target.value)} style={{ width: 80 }} />
+            <button className="primary" onClick={add}>+ ADD RULE</button>
+          </div>
+        ) : (
+          <div className="dimtxt">No data source — install the observability agent first. You cannot alert on data you do not collect.</div>
+        )}
         <table className="list" style={{ marginTop: 10 }}>
           <thead><tr><th>metric</th><th>condition</th><th>state</th><th></th></tr></thead>
           <tbody>
@@ -772,7 +793,7 @@ export function Monitoring({ game, view, refresh }: { game: string; view: GameVi
           </tbody>
         </table>
         {view.alerts.length === 0 ? <div className="dimtxt" style={{ marginTop: 6 }}>No rules — you are flying blind.</div> : null}
-        <div className="dimtxt" style={{ marginTop: 8 }}>Latest: error {(m.error_pct ?? 0).toFixed(1)}% · cpu {(m.cpu_pct ?? 0).toFixed(0)}% · disk {(m.disk_pct ?? 0).toFixed(0)}%</div>
+        {view.agentInstalled ? <div className="dimtxt" style={{ marginTop: 8 }}>Latest: error {(m.error_pct ?? 0).toFixed(1)}% · cpu {(m.cpu_pct ?? 0).toFixed(0)}% · disk {(m.disk_pct ?? 0).toFixed(0)}%</div> : null}
       </div>
 
       <TracingPanel game={game} view={view} refresh={refresh} />
@@ -1131,7 +1152,10 @@ export function Cloud({ game, view, refresh }: { game: string; view: GameView; r
           {view.agentInstalled ? (
             <span className="pill ok">installed — metrics flowing</span>
           ) : (
-            <button className="primary" onClick={async () => { await api.cloudAgent(game); say('agent installed on web-01'); }}>INSTALL AGENT ($25/mo)</button>
+            <div>
+              <button className="primary" onClick={async () => { await api.cloudAgent(game); say('agent installed on web-01'); }}>INSTALL AGENT ($25/mo)</button>
+              <div className="dimtxt" style={{ marginTop: 8 }}>Without it: no dashboards, no alerts, no history — and outages reach you as customer tickets, minutes after impact begins.</div>
+            </div>
           )}
         </div>
 
