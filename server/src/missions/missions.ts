@@ -1,0 +1,568 @@
+// Mission data — the game curriculum. Requirements are code checks over WORLD
+// STATE (not clicks), hints are progressive, rewards feed the economy/skills.
+import { World } from '../types';
+import * as fs from '../sim/fs';
+import { inspectDockerfile } from '../sim/host';
+import { status as gitStatus, isIgnored } from '../sim/git';
+import { parseNginxSites, httpRequest, hostServesApi } from '../sim/net';
+import { analyzeStages, loadPipeline } from '../sim/ci';
+import { diskUsagePct, audit } from '../world';
+
+export interface Requirement { id: string; label: string; check: (w: World) => boolean }
+
+export interface MissionDef {
+  id: string;
+  index: number;
+  title: string;
+  phase: 'build' | 'operate';
+  story: string;
+  objective: string;
+  coaching: string;
+  skills: string[];
+  requirements: Requirement[];
+  hints: string[];
+  rewards: { cash: number; xp: Record<string, number> };
+  onStart?: (w: World) => void;
+  onComplete?: (w: World) => void;
+}
+
+// ---------- helper shorthands ----------
+const f = (w: World, path: string) => fs.getFile(w.hosts['web-01'].fs, path);
+const read = (w: World, path: string) => fs.readFile(w.hosts['web-01'].fs, path);
+const svc = (w: World, name: string) => w.hosts['web-01'].services[name];
+const dirExists = (w: World, path: string) => Boolean(fs.getDir(w.hosts['web-01'].fs, path));
+
+function domain(w: World): string { return `${w.company.slug}.dev`; }
+function apiDomain(w: World): string { return `api.${w.company.slug}.dev`; }
+
+function configJsNoSecret(w: World): boolean {
+  const content = read(w, '/opt/app/config.js') ?? '';
+  return content.includes('process.env.DB_PASSWORD') && !content.includes('b1gmeter-prod-2024');
+}
+
+function nginxProxySite(w: World): string | null {
+  for (const site of parseNginxSites(w.hosts['web-01'])) {
+    if (site.proxyPass && site.proxyPass.includes('8080')) return site.file;
+  }
+  return null;
+}
+
+function lastRun(w: World) { return w.ci.runs[w.ci.runs.length - 1]; }
+
+function missionApiContainer(w: World): boolean {
+  return w.docker.containers.some((c) => c.status === 'running' && c.hostPort === 8080 && (c.serviceRef === 'api' || c.name.toLowerCase().includes('api') || c.image.toLowerCase().includes('api')));
+}
+
+// =====================================================================
+// MISSIONS
+// =====================================================================
+export const MISSIONS: MissionDef[] = [
+  // -------------------------------------------------------- 1
+  {
+    id: 'm01-ssh',
+    index: 1,
+    title: 'Day One: the handoff note',
+    phase: 'build',
+    story: 'You just joined as the first platform hire. Jordan (founder) left a handoff note on your laptop. The API is down and there is a customer demo at 10:30. Everything the company has lives on one server.',
+    objective: `Read the handoff note on your laptop, then SSH into the company server.`,
+    coaching: 'The terminal starts on YOUR laptop. `ls` to find the note, `cat` to read it, then use `ssh user@host`.',
+    skills: ['linux'],
+    requirements: [
+      { id: 'note-read', label: 'Read the handoff note (cat handoff.txt)', check: (w) => Boolean(w.flags.readHandoff) },
+      { id: 'ssh-in', label: 'SSH into web-01 as dev', check: (w) => w.session.hostId === 'web-01' && w.session.user === 'dev' }
+    ],
+    hints: [
+      'Files in the current directory: run `ls` to see them.',
+      '`cat handoff.txt` prints the note. It contains the server address and username.',
+      'Type: ssh dev@203.0.113.10 — then type anything as the password.'
+    ],
+    rewards: { cash: 500, xp: { linux: 20 } }
+  },
+  // -------------------------------------------------------- 2
+  {
+    id: 'm02-dead-api',
+    index: 2,
+    title: 'The case of the dead API',
+    phase: 'build',
+    story: 'You are in. The api.service unit exists but the app is not answering. The previous dev left notes in ~/notes.txt. Systemd says the service failed at boot.',
+    objective: 'Find out WHY the API is down, make it start, and make it survive reboots. Verify with curl.',
+    coaching: 'Classic trio: `journalctl -u api` (why it failed), `ps aux` + `ss -tulpn` (who owns :8080), `systemctl start/enable api`. When you find the culprit, `kill <PID>` it.',
+    skills: ['linux', 'observability'],
+    requirements: [
+      { id: 'svc-active', label: 'api.service is active', check: (w) => svc(w, 'api')?.state === 'active' },
+      { id: 'svc-enabled', label: 'api.service is enabled (starts on boot)', check: (w) => Boolean(svc(w, 'api')?.enabled) },
+      { id: 'port-listening', label: 'Something healthy answers on :8080', check: (w) => {
+        const res = httpRequest(w, 'http://localhost:8080/health');
+        return res.ok && res.status === 200;
+      } },
+      { id: 'stale-gone', label: 'The stale legacy process is gone', check: (w) => !w.hosts['web-01'].processes.some((p) => p.cmd.includes('legacy-server') && p.state !== 'zombie') }
+    ],
+    hints: [
+      'Ask systemd what happened: `journalctl -u api -n 10`. The last error line is the whole story.',
+      '`ps aux` shows a process that should not be there, holding port 8080. `ss -tulpn` confirms which process owns a port.',
+      'Kill the stale process: sudo kill 1024. Then: sudo systemctl start api && sudo systemctl enable api. Check: curl localhost:8080/health'
+    ],
+    rewards: { cash: 1000, xp: { linux: 30, observability: 10 } }
+  },
+  // -------------------------------------------------------- 3
+  {
+    id: 'm03-permissions',
+    index: 3,
+    title: 'Root cause: permissions',
+    phase: 'build',
+    story: 'A security review flags that the API runs as root — a bug in the app would own the whole box. The app only needs to run as the dev user.',
+    objective: 'Run the API as a non-root user: change the unit file (User=), fix file ownership, and restart the service.',
+    coaching: 'Edit /etc/systemd/system/api.service in the EDITOR tab (set User=dev). Take ownership of the app: chown -R dev:dev /opt/app. Then daemon-reload and restart.',
+    skills: ['linux', 'security'],
+    requirements: [
+      { id: 'unit-user', label: 'api.service unit sets User=dev (not root)', check: (w) => {
+        const unit = read(w, '/etc/systemd/system/api.service') ?? '';
+        return /User\s*=\s*dev\s*$/m.test(unit);
+      } },
+      { id: 'app-owned', label: '/opt/app is owned by dev', check: (w) => {
+        const node = fs.getNode(w.hosts['web-01'].fs, '/opt/app/server.js');
+        return node?.owner === 'dev';
+      } },
+      { id: 'svc-active', label: 'api.service restarted and active as dev', check: (w) => svc(w, 'api')?.state === 'active' && svc(w, 'api')?.user === 'dev' }
+    ],
+    hints: [
+      'Open the EDITOR tab, browse to /etc/systemd/system/api.service and change `User=root` to `User=dev`.',
+      'The app files still belong to root: sudo chown -R dev:dev /opt/app gives them to the dev user.',
+      'After editing a unit file: sudo systemctl daemon-reload && sudo systemctl restart api. Verify: systemctl status api'
+    ],
+    rewards: { cash: 1000, xp: { linux: 20, security: 30 } }
+  },
+  // -------------------------------------------------------- 4
+  {
+    id: 'm04-nginx',
+    index: 4,
+    title: 'The front door',
+    phase: 'build',
+    story: 'Customers should not talk to your app process on a weird port — and the app must never run privileged itself. Time for a reverse proxy on :80.',
+    objective: 'Install nginx, proxy port 80 → 127.0.0.1:8080, open port 80 in the firewall, and make nginx start on boot.',
+    coaching: 'sudo apt-get install -y nginx. Write a site config in /etc/nginx/sites-enabled/acme.conf with a server block (listen 80; proxy_pass http://127.0.0.1:8080;). Test: nginx -t... then start it. Open the firewall: ufw allow 80/tcp.',
+    skills: ['networking', 'linux'],
+    requirements: [
+      { id: 'nginx-installed', label: 'nginx is installed', check: (w) => w.hosts['web-01'].packages.includes('nginx') },
+      { id: 'site-conf', label: 'A site config proxies to 127.0.0.1:8080', check: (w) => nginxProxySite(w) !== null },
+      { id: 'nginx-active', label: 'nginx service is running', check: (w) => svc(w, 'nginx')?.state === 'active' },
+      { id: 'fw-80', label: 'Port 80 is reachable (firewall)', check: (w) => w.firewall.allowedPorts.includes(80) },
+      { id: 'curl-80', label: 'curl http://localhost/ reaches the API', check: (w) => {
+        const res = httpRequest(w, 'http://localhost/');
+        return res.ok && res.status === 200;
+      } }
+    ],
+    hints: [
+      'Install: sudo apt-get install -y nginx. nginx ships with a default site in /etc/nginx/sites-enabled/default.',
+      'Create /etc/nginx/sites-enabled/acme.conf via the EDITOR:',
+      'server {\n  listen 80;\n  server_name _;\n  location / {\n    proxy_pass http://127.0.0.1:8080;\n  }\n}\nThen: sudo systemctl enable nginx && sudo systemctl start nginx && sudo ufw allow 80/tcp'
+    ],
+    rewards: { cash: 1500, xp: { networking: 40, linux: 10 } }
+  },
+  // -------------------------------------------------------- 5
+  {
+    id: 'm05-dns',
+    index: 5,
+    title: "What's in a name?",
+    phase: 'build',
+    story: `Nobody types IP addresses. The company owns the zone ${'{domain}'} — point api.${'{domain}'} at the server so customers get a real URL.`,
+    objective: 'In the CLOUD console → DNS, add an A record: api → 203.0.113.10. Verify with dig and curl.',
+    coaching: 'DNS records live in the cloud console (CLOUD tab → DNS). Then `dig +short api.{domain}` and `curl http://api.{domain}/health` should both work — try them from your laptop (type `exit` first).',
+    skills: ['networking'],
+    requirements: [
+      { id: 'a-record', label: 'A record api → 203.0.113.10 exists', check: (w) => w.dns[domain(w)]?.[apiDomain(w)]?.value === '203.0.113.10' },
+      { id: 'resolves', label: 'dig resolves the name', check: (w) => Boolean(w.dns[domain(w)]?.[apiDomain(w)]) },
+      { id: 'curl-domain', label: 'curl http://api.<domain>/health works from the laptop', check: (w) => {
+        const res = httpRequest(w, `http://${apiDomain(w)}/health`);
+        return res.ok && res.status === 200;
+      } }
+    ],
+    hints: [
+      'Open the CLOUD tab (left sidebar) → DNS section.',
+      'Add record: name "api", type A, value 203.0.113.10, TTL 300.',
+      'Test from outside: type `exit` in the terminal to get back to your laptop, then `dig +short api.' + '{domain}' + '` and `curl http://api.' + '{domain}' + '/health`.'
+    ],
+    rewards: { cash: 1500, xp: { networking: 30, cloud: 10 } }
+  },
+  // -------------------------------------------------------- 6
+  {
+    id: 'm06-git',
+    index: 6,
+    title: 'Version control or chaos',
+    phase: 'build',
+    story: 'The app directory is not a git repository. One bad `rm` and the company is over. Time for version control.',
+    objective: 'Turn /opt/app into a git repo, configure your identity, add a .gitignore, and make a first commit.',
+    coaching: 'git init, then git config user.name / user.email (git refuses to commit without them). Create .gitignore (node_modules/, .env, *.log). git add -A, git commit -m "..."',
+    skills: ['git'],
+    requirements: [
+      { id: 'repo', label: '/opt/app is a git repository', check: (w) => Boolean(w.git['/opt/app']) },
+      { id: 'identity', label: 'git identity configured', check: (w) => Boolean(w.session.env.GIT_AUTHOR_NAME && w.session.env.GIT_AUTHOR_EMAIL) },
+      { id: 'gitignore', label: '.gitignore exists and is committed', check: (w) => {
+        const repo = w.git['/opt/app'];
+        if (!repo) return false;
+        const head = repo.branches[repo.head]?.commit;
+        return Boolean(head && repo.commits[head]?.tree['.gitignore'] !== undefined);
+      } },
+      { id: 'commit', label: 'At least one commit exists', check: (w) => Object.keys(w.git['/opt/app']?.commits ?? {}).length >= 1 },
+      { id: 'clean', label: 'Working tree is clean', check: (w) => {
+        const repo = w.git['/opt/app'];
+        if (!repo) return false;
+        const s = gitStatus(w, repo);
+        return s.staged.length === 0 && s.unstaged.length === 0 && s.untracked.length === 0;
+      } }
+    ],
+    hints: [
+      'cd /opt/app && git init. Git needs to know who you are: git config user.name "You" && git config user.email "you@' + '{domain}' + '"',
+      'Create .gitignore (EDITOR tab) with: node_modules/  .env  *.log — then `git add -A`.',
+      'git commit -m "initial import of api source" — then `git status` should say "working tree clean".'
+    ],
+    rewards: { cash: 1500, xp: { git: 40 } }
+  },
+  // -------------------------------------------------------- 7
+  {
+    id: 'm07-branch',
+    index: 7,
+    title: 'Branches & the merge conflict',
+    phase: 'build',
+    story: 'A partner integration needs API_TIMEOUT=60. Work on a feature branch — and watch out: your teammate Jaime pushes to main while you work.',
+    objective: 'Create a feature branch, change apiTimeout to 60 in config.js, commit, then merge with main (Jaime pushed a change to the same file). Resolve the conflict properly.',
+    coaching: 'git checkout -b feature/timeout → edit config.js → git add + commit → git merge main (or pull). Git will stop on the conflict: open the file in the EDITOR, keep BOTH teammates\' intent (apiTimeout: 60 AND retryMax: 5), remove the markers, git add, git commit.',
+    skills: ['git'],
+    requirements: [
+      { id: 'branch', label: 'A feature branch was created', check: (w) => {
+        const repo = w.git['/opt/app'];
+        if (!repo) return false;
+        return Object.keys(repo.branches).some((b) => b !== 'main');
+      } },
+      { id: 'commit-feature', label: 'The timeout change was committed on the branch', check: (w) => {
+        const repo = w.git['/opt/app'];
+        if (!repo) return false;
+        return Object.values(repo.commits).some((c) => (c.tree['config.js'] ?? '').includes('apiTimeout: 60'));
+      } },
+      { id: 'conflict-resolved', label: 'Conflict resolved: no markers, both changes kept', check: (w) => {
+        const c = read(w, '/opt/app/config.js') ?? '';
+        return !c.includes('<<<<<<<') && /apiTimeout:\s*60/.test(c) && /retryMax:\s*5/.test(c);
+      } },
+      { id: 'merged', label: 'Merged into main (merge commit with 2 parents)', check: (w) => {
+        const repo = w.git['/opt/app'];
+        if (!repo) return false;
+        const head = repo.branches['main']?.commit;
+        return Boolean(head && repo.commits[head].parents.length >= 2);
+      } },
+      { id: 'clean', label: 'Working tree clean on main', check: (w) => {
+        const repo = w.git['/opt/app'];
+        if (!repo) return false;
+        const s = gitStatus(w, repo);
+        return repo.head === 'main' && s.staged.length === 0 && s.unstaged.length === 0 && s.untracked.length === 0;
+      } }
+    ],
+    hints: [
+      'git checkout -b feature/api-timeout, then edit config.js: apiTimeout: 60. git add config.js && git commit -m "raise timeout for partner API".',
+      'Bring in the teammate: git pull origin main. Git prints CONFLICT (content): Merge conflict in config.js — the file now contains <<<<<<< / ======= / >>>>>>> markers.',
+      'In the EDITOR keep the lines you need so it reads: apiTimeout: 60, retryMax: 5 — no markers left. Then: git add config.js && git commit (completes the merge), then git checkout main && git merge feature/api-timeout.'
+    ],
+    rewards: { cash: 2000, xp: { git: 50 } },
+    onStart: (w) => {
+      // Jaime pushed a commit to ORIGIN/main (not local main) touching the same file
+      const repo = w.git['/opt/app'];
+      if (!repo) return;
+      const base = repo.branches['main']?.commit;
+      const content = (read(w, '/opt/app/config.js') ?? '').replace('apiTimeout: 30', 'apiTimeout: 45').replace('retryMax: 3', 'retryMax: 5');
+      const sha = 'jaime' + Math.abs(Math.floor(Math.sin(w.nowMin) * 1e6)).toString(16).slice(0, 4);
+      repo.commits[sha] = {
+        sha, message: 'bump retryMax, lower api timeout (Jaime)',
+        parents: base ? [base] : [], author: 'jaime', email: 'jaime@acme.dev',
+        timeMin: w.nowMin, tree: { 'config.js': content }, changed: ['config.js']
+      };
+      repo.remoteBranches['origin/main'] = sha;
+      repo.remotes['origin'] = 'git@acme.dev:acme/api.git';
+    }
+  },
+  // -------------------------------------------------------- 8
+  {
+    id: 'm08-secrets',
+    index: 8,
+    title: "Secrets don't belong in code",
+    phase: 'build',
+    story: 'You trip over a production password hard-coded in config.js — committed to history, visible to every future contractor. Fix the pattern, not just the value.',
+    objective: 'Move the DB password into /opt/app/.env, make config.js read it from the environment, keep .env out of git, and restart the service with the env file.',
+    coaching: 'Create .env (EDITOR): DB_PASSWORD=b1gmeter-prod-2024. Rewrite config.js to use process.env.DB_PASSWORD. Ensure .gitignore covers .env. Add EnvironmentFile=/opt/app/.env to the unit, daemon-reload, restart.',
+    skills: ['security', 'linux'],
+    requirements: [
+      { id: 'env-file', label: '/opt/app/.env exists with DB_PASSWORD', check: (w) => Boolean(f(w, '/opt/app/.env')?.content.includes('DB_PASSWORD=')) },
+      { id: 'config-clean', label: 'config.js uses process.env.DB_PASSWORD (secret removed)', check: configJsNoSecret },
+      { id: 'env-ignored', label: '.env is ignored by git (not tracked)', check: (w) => {
+        const repo = w.git['/opt/app'];
+        if (!repo) return false;
+        const head = repo.branches[repo.head]?.commit;
+        if (head && repo.commits[head].tree['.env'] !== undefined) return false;
+        return isIgnored(repo, w, '.env');
+      } },
+      { id: 'service-env', label: 'Service restarted with EnvironmentFile=/opt/app/.env', check: (w) => {
+        const unit = read(w, '/etc/systemd/system/api.service') ?? '';
+        return unit.includes('EnvironmentFile=/opt/app/.env');
+      } }
+    ],
+    hints: [
+      'EDITOR → /opt/app/.env (new file): DB_PASSWORD=b1gmeter-prod-2024',
+      'EDITOR → /opt/app/config.js: replace the password line with `dbPassword: process.env.DB_PASSWORD,`',
+      'Add `EnvironmentFile=/opt/app/.env` under [Service] in the unit file, then: sudo systemctl daemon-reload && sudo systemctl restart api. Check .gitignore contains .env'
+    ],
+    rewards: { cash: 2000, xp: { security: 50, git: 10 } }
+  },
+  // -------------------------------------------------------- 9
+  {
+    id: 'm09-docker',
+    index: 9,
+    title: 'Ship it in a box',
+    phase: 'build',
+    story: 'Works-on-my-machine is not a deployment strategy. The board has heard the word "containers" and would like some.',
+    objective: 'Install Docker, write a production-grade Dockerfile (non-root USER, EXPOSE 8080, HEALTHCHECK), build it, and run the API as a container on :8080 (the systemd service must be stopped).',
+    coaching: 'apt-get install -y docker.io. Write /opt/app/Dockerfile. Build: docker build -t acme/api:v1 . — run: docker run -d --name api -p 8080:8080 acme/api:v1. The port is still held by the systemd service — stop it first (sudo systemctl stop api).',
+    skills: ['docker'],
+    requirements: [
+      { id: 'docker-installed', label: 'Docker installed', check: (w) => w.hosts['web-01'].packages.includes('docker.io') },
+      { id: 'dockerfile', label: '/opt/app/Dockerfile exists', check: (w) => Boolean(f(w, '/opt/app/Dockerfile')) },
+      { id: 'non-root', label: 'Dockerfile uses a non-root USER', check: (w) => {
+        const df = inspectDockerfile(w);
+        return Boolean(df?.final?.user && df.final.user !== 'root' && !df.final.user.startsWith('root'));
+      } },
+      { id: 'expose', label: 'Dockerfile EXPOSEs 8080', check: (w) => Boolean(inspectDockerfile(w)?.final?.expose.includes(8080)) },
+      { id: 'healthcheck', label: 'Dockerfile has a HEALTHCHECK', check: (w) => Boolean(inspectDockerfile(w)?.final?.healthcheck) },
+      { id: 'image-built', label: 'Image built', check: (w) => w.docker.images.length > 0 },
+      { id: 'container-running', label: 'API container running on :8080', check: missionApiContainer },
+      { id: 'service-stopped', label: 'The systemd api service is stopped', check: (w) => svc(w, 'api')?.state !== 'active' },
+      { id: 'healthy', label: 'Container reports healthy', check: (w) => w.docker.containers.some((c) => c.status === 'running' && c.healthy) }
+    ],
+    hints: [
+      'Install: sudo apt-get install -y docker.io. Then write /opt/app/Dockerfile in the EDITOR. Start from node:20-alpine.',
+      'A solid Dockerfile:\nFROM node:20-alpine\nWORKDIR /app\nCOPY . .\nRUN npm install --omit=dev\nUSER node\nEXPOSE 8080\nHEALTHCHECK CMD wget -qO- http://localhost:8080/health || exit 1\nCMD ["node", "server.js"]',
+      'sudo systemctl stop api, then: docker build -t acme/api:v1 . && docker run -d --name api -p 8080:8080 acme/api:v1. Check: docker ps (healthy after ~2 min sim time)'
+    ],
+    rewards: { cash: 2500, xp: { docker: 60 } }
+  },
+  // -------------------------------------------------------- 10
+  {
+    id: 'm10-ci',
+    index: 10,
+    title: 'Robots deploy on Fridays too',
+    phase: 'build',
+    story: 'Deploying by hand from a SSH session at 23:00 is how Fridays die. The team agrees on a pipeline: test → build → docker → push → deploy.',
+    objective: 'Write .ci/pipeline.yml in the repo (checkout, test, build, docker build, push, deploy), commit it, run it in the CI tab, and ship the image to production from the registry.',
+    coaching: 'Pipeline YAML lives at /opt/app/.ci/pipeline.yml. Each step is `- name: …` with `run:` or `uses:`. Commit it, open the CI tab, press RUN PIPELINE. Deploy needs a pushed image tag (use registry.acme.dev/acme/api:…).',
+    skills: ['cicd', 'docker'],
+    requirements: [
+      { id: 'pipeline-file', label: '.ci/pipeline.yml exists in the repo', check: (w) => Boolean(w.git['/opt/app'] && f(w, '/opt/app/.ci/pipeline.yml')) },
+      { id: 'pipeline-valid', label: 'Pipeline has: checkout, test, build, docker build, push, deploy', check: (w) => {
+        if (!w.git['/opt/app']) return false;
+        const p = loadPipeline(w, '/opt/app', '.ci/pipeline.yml');
+        if (!p.valid) return false;
+        return analyzeStages(p).every((s) => s.present);
+      } },
+      { id: 'committed', label: 'Pipeline is committed', check: (w) => {
+        const repo = w.git['/opt/app'];
+        const head = repo?.branches[repo.head]?.commit;
+        return Boolean(head && repo!.commits[head].tree['.ci/pipeline.yml'] !== undefined);
+      } },
+      { id: 'run-success', label: 'A CI run has completed successfully', check: (w) => lastRun(w)?.status === 'success' },
+      { id: 'deployed', label: 'Image deployed from the registry', check: (w) => w.ci.deployments.some((d) => d.active && d.image.includes('registry.acme.dev')) }
+    ],
+    hints: [
+      'Minimal viable pipeline (commit it): name: deploy\non: push\nsteps:\n  - name: checkout\n    uses: git/checkout\n  - name: test\n    run: npm test',
+      '…continue with:\n  - name: build\n    run: npm run build\n  - name: docker_build\n    run: docker build -t registry.acme.dev/acme/api:v1 .\n  - name: push\n    run: docker push registry.acme.dev/acme/api:v1\n  - name: deploy\n    uses: sim/deploy',
+      'git add .ci/pipeline.yml && git commit -m "add pipeline" — then CI tab → RUN PIPELINE. The deploy step ships the pushed image.'
+    ],
+    rewards: { cash: 3000, xp: { cicd: 60, docker: 10 } }
+  },
+  // -------------------------------------------------------- 11
+  {
+    id: 'm11-db',
+    index: 11,
+    title: 'The database moves out',
+    phase: 'build',
+    story: 'Launch week. The sqlite file on the same box as the app is the biggest risk left: one disk failure and the company data is gone. Move to a managed Postgres.',
+    objective: 'Provision managed Postgres in the CLOUD console, run migrations (DATABASE tab), point the app at it via DATABASE_URL in .env, and redeploy the app with the new env.',
+    coaching: 'CLOUD → Databases → provision (db.small). DATABASE tab → RUN MIGRATIONS. Add DATABASE_URL=postgresql://api:***@db-01.stratus.cloud:5432/bigmeter to /opt/app/.env. Recreate the container so it picks up the env (docker stop/rm + docker run --env-file .env, or push a CI run).',
+    skills: ['databases', 'cloud'],
+    requirements: [
+      { id: 'provisioned', label: 'Managed Postgres provisioned', check: (w) => w.db.provisioned },
+      { id: 'migrated', label: 'Migrations ran against Postgres', check: (w) => Boolean(w.db.migrationsDone) },
+      { id: 'db-url', label: 'DATABASE_URL set in .env and loaded by the app', check: (w) => Boolean((w.app.env.DATABASE_URL ?? read(w, '/opt/app/.env') ?? '').includes('db-01.stratus.cloud')) },
+      { id: 'sql-works', label: 'psql query against the managed DB works', check: (w) => w.db.provisioned && Boolean(w.db.tables['orders']) },
+      { id: 'app-postgres', label: 'The running app reports database=postgres', check: (w) => {
+        const res = httpRequest(w, 'http://localhost:8080/health');
+        if (!res.ok || !res.body) return false;
+        try { return JSON.parse(res.body).database === 'postgres'; } catch { return false; }
+      } }
+    ],
+    hints: [
+      'CLOUD tab → Managed databases → Provision db.small. It appears on the architecture map immediately.',
+      'DATABASE tab → RUN MIGRATIONS moves the schema + data.',
+      'EDITOR → /opt/app/.env, add: DATABASE_URL=postgresql://api:SECRET@db-01.stratus.cloud:5432/bigmeter — then find the running container (`docker ps`) and `docker stop <name>`, recreate with env: docker run -d --name api -p 8080:8080 --env-file /opt/app/.env registry.acme.dev/acme/api:v1'
+    ],
+    rewards: { cash: 3000, xp: { databases: 50, cloud: 20 } },
+    onComplete: (w) => {
+      w.company.launched = true;
+      w.company.users = 1200;
+      audit(w, 'system', 'game', 'LAUNCH: BigMeter dashboard is public. Users are arriving.');
+    }
+  },
+  // -------------------------------------------------------- 12
+  {
+    id: 'm12-monitoring',
+    index: 12,
+    title: "If you can't measure it…",
+    phase: 'build',
+    story: 'Users exist now. The first outage report should come from YOU, not from a customer. Install the observability agent and define what "bad" means before it happens.',
+    objective: 'Install the monitoring agent (CLOUD console), then create at least two alert rules in the MONITORING tab: error rate > 2% and one capacity signal (CPU, memory or disk).',
+    coaching: 'CLOUD → Observability agent → Install. MONITORING → Alert rules → add: error_pct > 2, and cpu_pct > 85 (or disk_pct > 85). Alerts evaluate every simulated minute.',
+    skills: ['observability'],
+    requirements: [
+      { id: 'agent', label: 'Observability agent installed', check: (w) => w.monitoring.agentInstalled },
+      { id: 'error-alert', label: 'Alert rule: error_pct > 2 (or tighter)', check: (w) => w.monitoring.alertRules.some((r) => r.metric === 'error_pct' && r.threshold <= 5) },
+      { id: 'cap-alert', label: 'Alert rule: a capacity signal (cpu/mem/disk ≤ 90)', check: (w) => w.monitoring.alertRules.some((r) => ['cpu_pct', 'mem_pct', 'disk_pct'].includes(r.metric) && r.threshold <= 90) }
+    ],
+    hints: [
+      'CLOUD tab → Observability → INSTALL AGENT. Metrics appear in MONITORING instantly.',
+      'MONITORING tab → Alert rules → New rule: metric error_pct, op >, threshold 2.',
+      'Second rule: metric cpu_pct, op >, threshold 85. Watch the sparklines — they are live.'
+    ],
+    rewards: { cash: 2500, xp: { observability: 60 } },
+    onComplete: (w) => {
+      audit(w, 'system', 'game', 'The platform is real now. The world will test it.');
+    }
+  },
+  // -------------------------------------------------------- 13
+  {
+    id: 'm13-disk',
+    index: 13,
+    title: 'INCIDENT: the disk that ate the logs',
+    phase: 'build',
+    story: 'Watch the disk gauge. Logs on / are growing with no rotation in place. When it hits 100%, the API starts failing — and you get to live the pager life.',
+    objective: 'When the incident fires: diagnose from real symptoms (df, du, journalctl, logs), free the space, configure logrotate so it cannot recur, then file the postmortem with corrective actions.',
+    coaching: 'df -h shows the full disk. du -sh /var/log shows the culprit. Fix now: truncate/rotate old logs. Fix forever: /etc/logrotate.d/acme-api (EDITOR) with a weekly/rotate 7 policy. Then INCIDENTS → postmortem → tick the corrective actions.',
+    skills: ['observability', 'linux', 'security'],
+    requirements: [
+      { id: 'logrotate', label: 'logrotate configured for /var/log/app.log', check: (w) => Boolean(w.flags.logrotateConfigured) },
+      { id: 'disk-ok', label: 'Disk usage back under 85%', check: (w) => diskUsagePct(w) < 85 },
+      { id: 'incident-opened', label: 'The disk incident fired (advance time if needed)', check: (w) => w.monitoring.incidents.some((i) => i.kind === 'disk_full') },
+      { id: 'incident-resolved', label: 'Incident resolved', check: (w) => w.monitoring.incidents.some((i) => i.kind === 'disk_full' && i.status === 'resolved') },
+      { id: 'postmortem', label: 'Postmortem filed with corrective actions', check: (w) => w.monitoring.incidents.some((i) => i.kind === 'disk_full' && i.postmortemFiled) }
+    ],
+    hints: [
+      'Is it happening yet? The TERMINAL answer: df -h. When Use% hits 100 the API starts throwing ENOSPC — check journalctl -u api.',
+      'Free space now: sudo sh -c "echo \"\" > /var/log/app.log" (or rm old rotated logs) — the app recovers once the disk is under pressure level. Long term: EDITOR → /etc/logrotate.d/acme-api:\n/var/log/app.log {\n  daily\n  rotate 7\n  compress\n  missingok\n  notifempty\n}',
+      'After disk < 85% and logrotate is active the incident auto-resolves. Then MONITORING → INCIDENTS → file postmortem → tick corrective actions.'
+    ],
+    rewards: { cash: 4000, xp: { observability: 40, linux: 20 } }
+  },
+  // -------------------------------------------------------- 14
+  {
+    id: 'm14-baddeploy',
+    index: 14,
+    title: 'INCIDENT: Friday deploy gone wrong',
+    phase: 'build',
+    story: 'Ship the next release through your own pipeline. What could go wrong? (Something will go wrong. That is the point.)',
+    objective: 'Deploy the next release via CI. When error rate spikes: use metrics to confirm, roll back to the previous image, verify recovery, file the postmortem.',
+    coaching: 'Run the pipeline (CI tab) as usual. When the incident opens: MONITORING shows error_pct spiking; CI → Deployments → Roll back to previous. Confirm error_pct < 1 again. Postmortem. Tick corrective actions.',
+    skills: ['cicd', 'observability'],
+    requirements: [
+      { id: 'incident-fired', label: 'The bad-deploy incident fired (deploy the next release)', check: (w) => w.monitoring.incidents.some((i) => i.kind === 'bad_deploy') },
+      { id: 'rolled-back', label: 'Rolled back to the previous image', check: (w) => w.ci.deployments.some((d) => d.source === 'rollback') },
+      { id: 'incident-resolved', label: 'Incident resolved (error rate recovered)', check: (w) => w.monitoring.incidents.some((i) => i.kind === 'bad_deploy' && i.status === 'resolved') },
+      { id: 'postmortem', label: 'Postmortem filed (≥2 corrective actions)', check: (w) => {
+        const inc = w.monitoring.incidents.find((i) => i.kind === 'bad_deploy');
+        return Boolean(inc?.postmortemFiled && inc.corrective.filter((c) => c.done).length >= 2);
+      } }
+    ],
+    hints: [
+      'Trigger: CI tab → RUN PIPELINE (the deploy step ships the release).',
+      'Error rate spikes? MONITORING → INCIDENTS shows the open incident. CI tab → Deployments → ROLL BACK. The previous image takes over in seconds.',
+      'Confirm error_pct back under 1 in MONITORING (advance time if needed), then file the postmortem with at least two corrective actions.'
+    ],
+    rewards: { cash: 5000, xp: { cicd: 30, observability: 30 } },
+    onStart: (w) => {
+      // the NEXT release ships with a regression — this is the incident
+      w.flags.nextDeployHasBug = true;
+    },
+    onComplete: (w) => {
+      audit(w, 'system', 'game', 'INCIDENT CLOSED. Traffic keeps climbing — the platform is about to be tested again.');
+    }
+  },
+  // -------------------------------------------------------- 15
+  {
+    id: 'm15-dbperf',
+    index: 15,
+    title: 'The index that saved the bill',
+    phase: 'build',
+    story: 'Product-market fit hit: users jumped ~6x and the orders query is suddenly the slowest path in the company. The managed database is running hot, and the error rate is creeping up with it. The board asks whether to buy a bigger database. A senior engineer asks whether the query is even indexed.',
+    objective: 'Find the real bottleneck before spending money: EXPLAIN the hot query, add the missing index, and bring DB CPU back down at the new traffic level.',
+    coaching: 'DATABASE tab → run: EXPLAIN ANALYZE SELECT * FROM orders WHERE status = \'paid\'; — read the plan. Then fix the root cause with CREATE INDEX (name it idx_orders_status) and watch the DB CPU metric recover.',
+    skills: ['databases', 'observability'],
+    requirements: [
+      { id: 'investigated', label: 'Ran EXPLAIN on the orders query (see what the planner really does)', check: (w) => w.audit.some((a) => a.kind === 'db' && a.text.includes('EXPLAIN') && a.text.includes('orders')) },
+      { id: 'index', label: 'Created an index on orders(status)', check: (w) => Boolean(w.db.tables['orders']?.indexes.some((ix) => ix.columns.includes('status'))) },
+      { id: 'cpu-recovered', label: 'DB CPU peak under 70% over the last hour of traffic', check: (w) => {
+        const recent = (w.monitoring.series.db_cpu_pct ?? []).slice(-60);
+        if (recent.length < 10) return false;
+        return Math.max(...recent.map((p) => p.v)) < 70;
+      } },
+      { id: 'errors-ok', label: 'Error rate back under 2%', check: (w) => (w.monitoring.series.error_pct.at(-1)?.v ?? 99) < 2 }
+    ],
+    hints: [
+      'DATABASE tab → SQL console. Run: EXPLAIN ANALYZE SELECT * FROM orders WHERE status = \'paid\' — note it says "Seq Scan" and "full table scan over 1,048,576 rows".',
+      'The fix is one statement: CREATE INDEX idx_orders_status ON orders (status); — the planner switches to an Index Scan and every lookup stops reading the whole table.',
+      'Verify: run the EXPLAIN again (should say Index Scan using idx_orders_status), then watch the DB CPU gauge — advance time a few minutes and it should settle under 70%. Resizing the DB would also have "fixed" CPU, at 2x the monthly bill.'
+    ],
+    rewards: { cash: 4000, xp: { databases: 40, architecture: 20 } },
+    onStart: (w) => {
+      const before = Math.round(w.company.users);
+      w.company.users = Math.round(before * 6) + 1500;
+      audit(w, 'system', 'event', `Product-market fit: users jumped from ${before.toLocaleString()} to ${Math.round(w.company.users).toLocaleString()} in two weeks. The orders table is now the hottest path.`);
+    },
+    onComplete: (w) => {
+      audit(w, 'system', 'game', 'The database survives the growth. Next question the board keeps asking: "what happens if web-01 dies?"');
+    }
+  },
+  // -------------------------------------------------------- 16
+  {
+    id: 'm16-ha',
+    index: 16,
+    title: 'One server is a single point of failure',
+    phase: 'build',
+    story: 'Everything the company earns flows through one 203.0.113.10 box. A failed kernel upgrade would take the whole company down. The board approved a small HA budget: a second VM and a load balancer. And engineering practice demands proof — a chaos drill that kills web-01 on purpose.',
+    objective: 'Provision vm-02, deploy the API image to it, put the load balancer in front (update the api DNS record to the LB), get both backends healthy — then survive the automatic failover drill.',
+    coaching: 'CLOUD → Compute: provision vm-02 and deploy the latest registry image to it. CLOUD → Load balancer: provision lb-01, then CLOUD → DNS: update the api record to the LB IP. Both backends healthy = the drill can pass. The drill fires automatically ~90 minutes after this mission starts.',
+    skills: ['architecture', 'networking', 'cloud'],
+    requirements: [
+      { id: 'vm02', label: 'Second VM provisioned (vm-02)', check: (w) => Boolean(w.hosts['vm-02']) },
+      { id: 'vm02-app', label: 'API image deployed and running on vm-02', check: (w) => w.docker.containers.some((c) => (c.hostId ?? 'web-01') === 'vm-02' && c.status === 'running') },
+      { id: 'lb', label: 'Load balancer provisioned', check: (w) => Boolean(w.lb?.provisioned) },
+      { id: 'dns-lb', label: 'api DNS record points at the load balancer', check: (w) => Boolean(w.lb?.provisioned && w.dns[`${w.company.slug}.dev`]?.[`api.${w.company.slug}.dev`]?.value === w.lb.ip) },
+      { id: 'backends', label: 'Both backends serving (web-01 + vm-02)', check: (w) => Boolean(w.lb?.provisioned) && hostServesApi(w, 'web-01') && hostServesApi(w, 'vm-02') },
+      { id: 'drill', label: 'Failover drill passed (web-01 killed, site stayed up)', check: (w) => Boolean(w.flags.haDrillSurvived) }
+    ],
+    hints: [
+      'CLOUD tab → Compute → "Provision vm-02", then "Deploy latest image" (the registry already has your CI-built image). Wait ~2 sim minutes for its health check.',
+      'CLOUD tab → Load balancer → Provision lb-01. Then CLOUD → DNS: edit/add the record api → 203.0.113.20 (the LB IP). Traffic now flows Users → LB → {web-01, vm-02}.',
+      'The drill runs automatically ~90 sim minutes after the mission starts (16× speed helps). It kills web-01 for 30 minutes: if the LB can route to vm-02, users never notice and the drill passes. If it fails, it retries every ~3 hours — fix the architecture and let it try again.'
+    ],
+    rewards: { cash: 6000, xp: { architecture: 50, networking: 30, cloud: 20 } },
+    onStart: (w) => {
+      w.scheduledEvents.push({ atMin: w.nowMin + 90, kind: 'ha_drill' });
+      audit(w, 'system', 'game', 'HA mission started — a chaos drill (web-01 kernel panic) is armed for ~90 sim minutes from now.');
+    },
+    onComplete: (w) => {
+      w.flags.buildPhaseComplete = true;
+      audit(w, 'system', 'game', 'BUILD PHASE COMPLETE (v0.2) — 16 missions, a real platform, and proof it survives losing a server. OPERATE phase continues.');
+    }
+  }
+];
+
+// Phase-2 designed missions (data only — validators arrive with the systems)
+export const PHASE2_MISSIONS: { id: string; title: string; concept: string }[] = [
+  { id: 'm17-e2e', title: 'Clicking on purpose', concept: 'end-to-end tests + staging environment + approvals' },
+  { id: 'm18-terraform', title: 'Under new management', concept: 'Terraform: import manual infra, plan/apply, drift' },
+  { id: 'm19-k8s', title: 'Pods of plenty', concept: 'Kubernetes: Deployments, Services, Ingress, probes, HPA' },
+  { id: 'm20-dr', title: 'Out of region, out of mind', concept: 'backups, RPO/RTO, restore drills, regional failover' }
+];

@@ -1,0 +1,26 @@
+{
+  "name": "shipit-devops-game",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SHIP IT — a DevOps learning game / company simulator",
+  "scripts": {
+    "install:web": "npm --prefix web install",
+    "dev:server": "tsx server/src/index.ts",
+    "dev:web": "npm --prefix web run dev",
+    "build:web": "npm --prefix web run build",
+    "start": "npm run build:web && tsx server/src/index.ts",
+    "serve": "tsx server/src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
+  }
+}
