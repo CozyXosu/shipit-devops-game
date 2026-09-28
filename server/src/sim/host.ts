@@ -8,6 +8,8 @@ import { httpRequest, formatCurl, digLookup, resolveHostname } from './net';
 import { getRepo, findRepoFor, initRepo, status as gitStatus, makeCommit, mergeBranch, completeMergeCommit, logLines, worktreeFiles, resolveRef, treeDiff, isAncestor, GITIGNORE_DEFAULT } from './git';
 import { buildImage, runContainer, pushToRegistry, parseDockerfile, hashStr } from './docker';
 import { runSql } from './dbsim';
+import { kubectlCmd } from './k8s';
+import { terraformCmd, ensureTfState } from './terraform';
 
 export interface CmdOut { lines: OutLine[]; code: number }
 
@@ -630,8 +632,18 @@ const COMMANDS: Record<string, Handler> = {
     return { lines: [L('logout')], code: 0 };
   },
   clear: () => ({ lines: [{ text: '__CLEAR__' }], code: 0 }),
-  terraform: () => ({ lines: [L('terraform: infrastructure-as-code arrives in Phase 2 — for now manage resources in the CLOUD console.', 'warn')], code: 127 }),
-  kubectl: () => ({ lines: [L('kubectl: Kubernetes arrives in Phase 2 — the cluster is not unlocked yet.', 'warn')], code: 127 })
+  terraform: (w, _h, argv) => {
+    if (!_h.packages.includes('terraform')) {
+      return { lines: [L('terraform: command not found — install it first: sudo apt-get install -y terraform', 'err')], code: 127 };
+    }
+    ensureTfState(w);
+    const res = terraformCmd(w, argv, w.session.cwd);
+    return { lines: res.lines, code: res.code };
+  },
+  kubectl: (w, _h, argv) => {
+    const res = kubectlCmd(w, argv);
+    return { lines: res.lines, code: res.code };
+  }
 };
 
 function env(w: World): Record<string, string> { return w.session.env; }
@@ -748,7 +760,8 @@ const APT_PACKAGES: Record<string, { desc: string; sizeMB: number }> = {
   logrotate: { desc: 'Log rotation utility', sizeMB: 1 },
   'postgresql-client': { desc: 'front-end programs for PostgreSQL', sizeMB: 12 },
   htop: { desc: 'interactive processes viewer', sizeMB: 2 },
-  sqlite3: { desc: 'Command line interface for SQLite', sizeMB: 3 }
+  sqlite3: { desc: 'Command line interface for SQLite', sizeMB: 3 },
+  terraform: { desc: 'infrastructure-as-code tool (HashiCorp)', sizeMB: 39 }
 };
 
 function aptCmd(w: World, h: SimHost, argv: string[]): CmdOut {

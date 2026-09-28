@@ -1,0 +1,122 @@
+{
+  "id": "postmortem-tournament",
+  "name": "The Postmortem Tournament",
+  "version": 1,
+  "author": "SHIP IT core",
+  "tournament": true,
+  "requiresCompleted": "m28-finops",
+  "description": "Five rounds of live incidents in front of a scoreboard. Rival teams are playing the same gauntlet; your postmortems are scored on speed (MTTR), honesty (corrective actions) and follow-through (credits claimed, restores proven). Finish first.",
+  "missions": [
+    {
+      "id": "pmr-01",
+      "title": "Registration desk",
+      "story": "The conference banner goes up in the audit feed: POSTMORTEM TOURNAMENT — ROUND ONE OPENS SHORTLY. Three rival teams are on the board: Cloud Nine, Null Pointers, Ping Payments. The rules are one line: incidents will happen. What you write after them is the score.",
+      "objective": "A traffic surge is coming. Resolve it, then file the postmortem with at least two corrective actions — inside 150 sim minutes of it opening.",
+      "coaching": "Surges self-resolve when the traffic dies down; autoscaling and enough replicas shorten the pain. Then MONITORING → INCIDENTS → postmortem: tick the actions you actually did. The scoreboard (MODES tab) is live.",
+      "skills": ["observability"],
+      "requirements": [
+        { "id": "surge-resolved", "label": "The traffic surge was resolved", "check": { "type": "incidentResolved", "kind": "traffic_spike", "sinceStart": true } },
+        { "id": "pm", "label": "Postmortem filed with ≥2 corrective actions", "check": { "type": "postmortemFiled", "kind": "traffic_spike", "correctiveDoneAtLeast": 2, "sinceStart": true } },
+        { "id": "mttr", "label": "MTTR ≤ 150 sim minutes", "check": { "type": "mttrWithin", "maxMin": 150, "sinceStart": true } }
+      ],
+      "hints": [
+        "The surge opens ~10 sim minutes after the round starts. It resolves itself when the spike ends — your job is to be READY: enough replicas, then watch.",
+        "The moment it resolves: MONITORING → INCIDENTS → the surge → FILE POSTMORTEM. Tick at least two corrective actions (autoscale, traffic alert, capacity).",
+        "The clock is the MTTR requirement — 150 sim minutes from incident open to resolution. If it is dragging, check that nothing is starving capacity."
+      ],
+      "rewards": { "cash": 2000, "xp": { "observability": 30 }, "tournamentPoints": 8 },
+      "onStart": {
+        "schedule": [{ "kind": "ambient_incident", "inMin": 10 }],
+        "audit": "TOURNAMENT ROUND 1: a large account is about to hammer the orders API. Clock starts when it opens."
+      }
+    },
+    {
+      "id": "pmr-02",
+      "title": "Round of eight: the rollback",
+      "story": "Round two, and the organizers stop pretending: someone on YOUR team ships a broken release to production while you watch. The scoreboard does not care whose commit it was. It cares how fast the blast radius shrinks.",
+      "objective": "A bad deploy is coming (~10 sim minutes). Roll it back and file the postmortem with three corrective actions — MTTR inside 90 minutes.",
+      "coaching": "CI tab → the latest deployment → ROLLBACK. That is the whole skill: deciding in seconds what took your users hours. Then the postmortem: rollback, error alert, staging gate.",
+      "skills": ["cicd", "observability"],
+      "requirements": [
+        { "id": "rolled-back", "label": "The bad deploy was rolled back and resolved", "check": { "type": "incidentResolved", "kind": "bad_deploy", "sinceStart": true } },
+        { "id": "mttr", "label": "MTTR ≤ 90 sim minutes (blast radius shrinks fast)", "check": { "type": "mttrWithin", "maxMin": 90, "sinceStart": true } },
+        { "id": "pm", "label": "Postmortem with ≥3 corrective actions", "check": { "type": "postmortemFiled", "kind": "bad_deploy", "correctiveDoneAtLeast": 3, "sinceStart": true } }
+      ],
+      "hints": [
+        "The error spike lands ~10 sim minutes in. CI tab → DEPLOYMENTS → the newest one → ROLLBACK. Do not debug in production what you can undo in one click.",
+        "90 minutes MTTR — the clock starts when the incident opens, and the rollback is instant once you click. The postmortem can follow after.",
+        "Three corrective actions: roll back, error-rate alert, staging/e2e gate before prod. Tick what is true."
+      ],
+      "rewards": { "cash": 2500, "xp": { "cicd": 30, "observability": 20 }, "tournamentPoints": 10 },
+      "onStart": {
+        "schedule": [{ "kind": "tournament_incident", "inMin": 10, "payload": { "kind": "bad_deploy" } }],
+        "audit": "TOURNAMENT ROUND 2: a teammate is about to ship a broken release. The scoreboard does not care whose commit it was."
+      }
+    },
+    {
+      "id": "pmr-03",
+      "title": "Semifinal: their outage, your pager",
+      "story": "Semifinal. The organizers schedule a REGION-WIDE PROVIDER OUTAGE and call it a level playing field — every team gets the same outage. You cannot fix it. You can still be the team that reads the status page, banks the credit and writes the honest postmortem.",
+      "objective": "Survive the provider outage (~15 sim minutes from now), claim the SLA credit, and file the postmortem with two corrective actions.",
+      "coaching": "Provider outages resolve themselves; the credit window is a sim day. CLOUD → Providers → REQUEST SLA CREDIT after it ends. Postmortem: status-page check, credit claimed, provider comparison.",
+      "skills": ["cloud", "observability"],
+      "requirements": [
+        { "id": "survived", "label": "The provider outage resolved", "check": { "type": "incidentResolved", "kind": "provider_outage", "sinceStart": true } },
+        { "id": "credit", "label": "SLA credit claimed for it", "check": { "type": "incidentTimelineContains", "kind": "provider_outage", "text": "SLA credit claimed", "sinceStart": true } },
+        { "id": "pm", "label": "Postmortem with ≥2 corrective actions", "check": { "type": "postmortemFiled", "kind": "provider_outage", "correctiveDoneAtLeast": 2, "sinceStart": true } }
+      ],
+      "hints": [
+        "Everything drops to ~80% errors for 15–45 sim minutes and NOTHING you own is broken. Check the incident detail: it says provider-side. Ride it out.",
+        "When it ends: CLOUD → Providers → REQUEST SLA CREDIT. Providers pay for their own outages — if you ask. The claim lands in the incident timeline (that is what the scoreboard checks).",
+        "Then the postmortem: status page first, credit claimed, evaluate a more reliable provider. The honest postmortem beats the heroic one."
+      ],
+      "rewards": { "cash": 3000, "xp": { "cloud": 30, "observability": 20 }, "tournamentPoints": 10 },
+      "onStart": {
+        "schedule": [{ "kind": "provider_outage", "inMin": 15 }],
+        "audit": "TOURNAMENT SEMIFINAL: your provider's region is about to have a very bad day. Same outage for every team."
+      }
+    },
+    {
+      "id": "pmr-04",
+      "title": "Final four: drop the database",
+      "story": "The organizers have stopped being subtle: they drop your ORDERS TABLE. In front of everyone. This is the round that separates the teams with backups from the teams with opinions about backups.",
+      "objective": "Restore the orders table from YOUR backup — RTO ≤ 150 sim minutes — and file the postmortem with three corrective actions.",
+      "coaching": "CLOUD → Databases → RESTORE FROM BACKUP (point-in-time picks the last snapshot before the drop — that only works if backups were enabled BEFORE now). Verify rows in the DATABASE tab, then postmortem.",
+      "skills": ["databases", "observability"],
+      "requirements": [
+        { "id": "restored", "label": "Orders table restored (≥900k rows back)", "check": { "type": "dbOrdersRowsAtLeast", "count": 900000 } },
+        { "id": "rto", "label": "MTTR ≤ 150 sim minutes from the drop", "check": { "type": "mttrWithin", "maxMin": 150, "sinceStart": true } },
+        { "id": "pm", "label": "Postmortem with ≥3 corrective actions", "check": { "type": "postmortemFiled", "kind": "data_loss", "correctiveDoneAtLeast": 3, "sinceStart": true } }
+      ],
+      "hints": [
+        "The drop lands ~10 sim minutes in. If automated backups are on, a snapshot from yesterday exists — the restore is one button (CLOUD → Databases).",
+        "RTO is measured from incident open: every minute you spend reading chat is a minute of RTO. Restore first, feel things later.",
+        "Verify ≥900k rows in the DATABASE tab (\\dt or SELECT count-ish), then postmortem: backups, restore drill, PITR/retention."
+      ],
+      "rewards": { "cash": 3500, "xp": { "databases": 40, "observability": 20 }, "tournamentPoints": 12 },
+      "onStart": {
+        "schedule": [{ "kind": "dr_drill", "inMin": 10 }],
+        "audit": "TOURNAMENT FINAL FOUR: they are about to drop your orders table. Backups or opinions — pick one now."
+      }
+    },
+    {
+      "id": "pmr-05",
+      "title": "The trophy",
+      "story": "No incident this round. Just the scoreboard, the rivals, and the question the tournament actually asks: when the pager fires, is your team the one that recovers, documents and gets billed correctly? Points decide. So do the last few minutes of calm.",
+      "objective": "Clear the scoreboard round: no open incidents, all four rounds won, and tournament points ≥ 38 — ahead of every rival team.",
+      "coaching": "The MODES tab shows live standings. If a rival is ahead, the only lever left is speed on any remaining rounds — points come from winning them fast.",
+      "skills": ["observability", "architecture"],
+      "requirements": [
+        { "id": "calm", "label": "No open incidents (a tidy board)", "check": { "type": "noOpenIncidents" } },
+        { "id": "rounds", "label": "All four incident rounds won", "check": { "type": "packMissionsDoneAtLeast", "count": 4 } },
+        { "id": "points", "label": "Tournament points ≥ 38 (rivals: watch the board)", "check": { "type": "tournamentPointsAtLeast", "points": 38 } }
+      ],
+      "hints": [
+        "Resolve anything still open — the trophy round requires a calm board (no open incidents).",
+        "Points come from the four rounds (8+10+10+12 = 40). If you were slow somewhere, the rivals may have caught up — check the MODES tab standings.",
+        "Nothing else to do: no open incidents, 4 rounds, ≥38 points. Collect the trophy."
+      ],
+      "rewards": { "cash": 6000, "xp": { "observability": 40, "architecture": 30 }, "tournamentPoints": 6 }
+    }
+  ]
+}

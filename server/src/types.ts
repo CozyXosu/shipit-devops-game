@@ -160,6 +160,7 @@ export interface ManagedPostgres {
   cpuPct: number;
   migrationsDone: boolean;
   seqScansPerSec: number;
+  backups: DbBackupState;
 }
 
 // ---------- CI ----------
@@ -168,11 +169,15 @@ export interface PipelineStep {
   uses?: string;
   run?: string;
   with?: Record<string, string>;
+  /** gate: production deploy must be approved before this step runs */
+  needsApproval?: boolean;
 }
 
 export interface Pipeline {
   name: string;
   on: string;
+  /** progressive delivery: canary | blue-green | rolling (default) */
+  strategy?: string;
   steps: PipelineStep[];
   path: string; // repo-relative file path
   valid: boolean;
@@ -190,8 +195,20 @@ export interface CiRun {
   startedAtMin: number;
   pipelinePath: string;
   commitSha: string;
-  status: 'running' | 'success' | 'failed';
+  status: 'running' | 'success' | 'failed' | 'waiting_approval' | 'rejected';
   stages: CiStage[];
+  /** steps still to execute while the run waits for a production approval */
+  pendingSteps?: PipelineStep[];
+  /** image the run is trying to ship (for approval rendering) */
+  image?: string;
+}
+
+/** Staging environment: the dress rehearsal stage before production. */
+export interface StagingEnv {
+  image: string | null;
+  deployedAtMin: number;
+  e2ePassed: boolean;
+  e2eLog: string[];
 }
 
 export interface Deployment {
@@ -203,9 +220,292 @@ export interface Deployment {
   active: boolean;
 }
 
+// ---------- Terraform ----------
+export interface TfResource {
+  address: string; // "stratus_vm.web-01"
+  type: string;
+  name: string;
+  attrs: Record<string, string>;
+  id: string; // cloud resource id shown in state
+}
+
+export interface TerraformState {
+  initialized: boolean;
+  dir: string; // working directory (default /opt/infra)
+  resources: Record<string, TfResource>; // address -> resource
+  lastPlan: string[]; // rendered plan output
+  lastPlanAtMin: number;
+  lastPlanClean: boolean;
+  driftDetected: boolean;
+  driftResolved: boolean;
+}
+
+// ---------- Kubernetes ----------
+export interface K8sPod {
+  name: string;
+  deployment: string;
+  node: string;
+  phase: 'Pending' | 'Running' | 'Ready' | 'CrashLoopBackOff' | 'Terminating';
+  ready: boolean;
+  restarts: number;
+  image: string;
+  startedAtMin: number;
+  revision: number;
+}
+
+export interface K8sDeployment {
+  name: string;
+  image: string;
+  replicas: number;
+  readyReplicas: number;
+  revision: number;
+  strategy: 'RollingUpdate' | 'Recreate';
+  containerPort: number;
+  readinessProbe: boolean;
+  livenessProbe: boolean;
+  env: Record<string, string>;
+  history: { revision: number; image: string; atMin: number }[];
+  createdAtMin: number;
+}
+
+export interface K8sService {
+  name: string;
+  type: 'ClusterIP' | 'LoadBalancer';
+  port: number;
+  targetPort: number;
+  selector: string;
+  ingressIp?: string; // assigned by the cloud when type=LoadBalancer
+}
+
+export interface K8sIngress {
+  name: string;
+  host: string;
+  path: string;
+  service: string;
+  servicePort: number;
+}
+
+export interface K8sHpa {
+  name: string;
+  deployment: string;
+  minReplicas: number;
+  maxReplicas: number;
+  targetCpuPct: number;
+  currentReplicas: number;
+  peakedAtMin?: number; // last minute at which it scaled out beyond min
+}
+
+export interface K8sCluster {
+  provisioned: boolean;
+  name: string; // k8s-01
+  version: string;
+  ip: string; // load-balanced API endpoint of the cluster
+  nodes: string[];
+  deployments: Record<string, K8sDeployment>;
+  services: Record<string, K8sService>;
+  ingresses: Record<string, K8sIngress>;
+  hpas: Record<string, K8sHpa>;
+  pods: K8sPod[];
+  nextPodSuffix: number;
+  /** set when a RollingUpdate completed without a no-ready-pods moment */
+  zeroDowntimeProven: boolean;
+}
+
+/** Progressive delivery: a canary release serving a slice of traffic. */
+export interface CanaryState {
+  active: boolean;
+  image: string;
+  startedAtMin: number;
+  trafficPct: number;
+  /** last observed canary error rate while active */
+  errorPct: number;
+  status: 'running' | 'promoted' | 'aborted';
+  reason?: string;
+}
+
+// ---------- Team / hiring ----------
+export type EngineerRole = 'junior' | 'mid' | 'senior' | 'sre';
+
+export interface Engineer {
+  id: string;
+  name: string;
+  role: EngineerRole;
+  salaryMonthly: number;
+  hiredAtMin: number;
+}
+
+export interface TeamState {
+  engineers: Engineer[];
+  onCallId: string | null;
+}
+
+// ---------- Technical debt ----------
+export interface RefactorProject {
+  id: string;
+  label: string;
+  detail: string;
+  debtRemoved: number;
+  costCash: number;
+  durationMin: number;
+  startedAtMin?: number;
+  done: boolean;
+}
+
+export interface DebtState {
+  points: number;
+  /** how the debt was earned — newest first */
+  log: { atMin: number; text: string }[];
+  projects: RefactorProject[];
+}
+
+// ---------- SLOs ----------
+export interface SloState {
+  configured: boolean;
+  setAtMin?: number;
+  availabilityTarget: number; // e.g. 99.5 (%)
+  p95TargetMs: number;        // e.g. 600
+}
+
+// ---------- Cloud providers / multi-cloud (P3) ----------
+/** An active provider-side outage: you cannot fix it, only ride it out. */
+export interface ProviderOutage {
+  provider: string;
+  region: string;
+  startedAtMin: number;
+  durationMin: number;
+  /** set when the provider recovers; the SLA credit is claimable until it expires */
+  endedAtMin?: number;
+  creditClaimed: boolean;
+  incidentId?: string;
+}
+
+/** A whole-footprint migration between providers/regions. */
+export interface MigrationState {
+  toProvider: string;
+  toRegion: string;
+  startedAtMin: number;
+  durationMin: number;        // prep + replicate time before the cutover
+  downtimeMin: number;        // planned cutover downtime, reduced by preparation
+  status: 'running' | 'cutover';
+  cutoverEndsAtMin?: number;
+  costBefore: number;         // monthly infra cost where the migration began
+  narrated: number;           // progress narration steps already logged
+}
+
+export interface MigrationRecord {
+  fromProvider: string;
+  fromRegion: string;
+  toProvider: string;
+  toRegion: string;
+  atMin: number;
+  downtimeMin: number;
+  costBefore: number;
+  costAfter: number;
+}
+
+export interface CloudState {
+  provider: string;           // provider id (stratus | volt | orbit)
+  region: string;             // region id within the provider
+  sinceMin: number;
+  compared: boolean;          // ran the cost comparison (gates migration)
+  lastComparison?: { provider: string; region: string; monthlyCost: number; note: string }[];
+  outage?: ProviderOutage;    // active provider outage, if any
+  outagesSeen: number;
+  creditsTotal: number;       // SLA credits claimed, in dollars
+  migration?: MigrationState; // in-flight migration
+  migrations: MigrationRecord[];
+}
+
+// ---------- Products (P3) ----------
+export interface Product {
+  id: string;
+  name: string;
+  tagline: string;
+  tier: 'addon' | 'growth' | 'enterprise';
+  pricePerUserMonthly: number;
+  adoptionPct: number;        // share of company users expected to buy
+  infraMonthly: number;       // added infra cost once launched
+  buildCost: number;
+  buildDurationMin: number;
+  requires?: { slos?: boolean; satisfaction?: number; teamSize?: number };
+  startedAtMin?: number;
+  launchedAtMin?: number;
+}
+
+export interface ProductState {
+  products: Product[];
+}
+
+// ---------- FinOps (P3) ----------
+export interface FinOpsState {
+  budgetMonthly?: number;
+  budgetSetAtMin?: number;
+  daysUnderBudget: number;
+  daysOverBudget: number;
+  baselineMonthly?: number;   // infra cost when the FinOps effort started
+  baselineAtMin?: number;
+  seen: string[];             // recommendation ids present last tick
+  resolved: string[];         // recommendation ids acted on / no longer applicable
+  reservedProvider?: string;  // 1-year reserved compute commitment
+  reservedAtMin?: number;
+}
+
+// ---------- Challenges (P4) ----------
+export interface ChallengeDayResult {
+  day: number;
+  ok: boolean;
+  detail: string;
+}
+
+/** A scored run of one challenge against the live world. */
+export interface ChallengeRunState {
+  id: string;                  // challenge def id
+  startedAtMin: number;
+  durationMin: number;
+  status: 'active' | 'passed' | 'failed';
+  verdict?: string;
+  score?: number;              // meaning depends on the rule (see ChallengeDef.scoreLabel)
+  billAtStart?: number;        // budget rule: monthly infra snapshot
+  capMonthly?: number;         // budget rule: the line that must not be crossed
+  badMinAtStart?: number;      // availability rule: uptimeBadMin snapshot
+  disasterAtMin?: number;      // rto rule: when the disaster actually fired
+  days: ChallengeDayResult[];
+}
+
+// ---------- Postmortem tournament (P4) ----------
+export interface TournamentRival {
+  name: string;
+  points: number;
+}
+
+export interface TournamentState {
+  joinedAtMin: number;
+  points: number;
+  roundsWon: number;
+  rivals: TournamentRival[];
+  lastRivalTickMin?: number;
+  finished: boolean;
+  place?: number;
+}
+
+// ---------- Backups / DR ----------
+export interface DbSnapshot {
+  atMin: number;
+  label: string; // snap-20260929-0900
+  ordersRows: number;
+  sizeGB: number;
+}
+
+export interface DbBackupState {
+  enabled: boolean;
+  enabledAtMin?: number;
+  retentionDays: number;
+  snapshots: DbSnapshot[];
+  lastRestore?: { atMin: number; fromSnapshotAtMin: number; rpoMin: number; rtoMin: number };
+}
+
 // ---------- Monitoring ----------
 export interface MetricPoint { t: number; v: number }
-
 export interface AlertRule {
   id: string;
   metric: string;
@@ -219,7 +519,7 @@ export interface AlertRule {
 
 export interface Incident {
   id: string;
-  kind: 'disk_full' | 'bad_deploy' | 'db_saturation' | 'traffic_spike';
+  kind: 'disk_full' | 'bad_deploy' | 'db_saturation' | 'traffic_spike' | 'data_loss' | 'provider_outage';
   title: string;
   symptom: string;
   severity: 'SEV2' | 'SEV1';
@@ -235,7 +535,13 @@ export interface Incident {
 }
 
 // ---------- Economy / company ----------
-export interface CostLineItem { category: string; label: string; monthlyCost: number }
+export interface CostLineItem {
+  category: string;
+  label: string;
+  monthlyCost: number;
+  /** provider+region tag for cloud-hosted items (FinOps allocation) */
+  provider?: string;
+}
 
 export interface Company {
   name: string;
@@ -253,7 +559,7 @@ export interface AuditEvent { t: number; actor: string; kind: string; text: stri
 // ---------- The world ----------
 export interface AppRuntime {
   version: string;
-  mode: 'service' | 'container' | 'stopped';
+  mode: 'service' | 'container' | 'k8s' | 'stopped';
   image?: string;
   database: 'sqlite' | 'postgres';
   env: Record<string, string>; // effective env vars the app currently runs with
@@ -261,7 +567,7 @@ export interface AppRuntime {
 }
 
 export interface Flags {
-  [key: string]: boolean | number | undefined;
+  [key: string]: boolean | number | string | undefined;
 }
 
 export interface World {
@@ -283,7 +589,7 @@ export interface World {
   docker: { images: DockerImage[]; containers: DockerContainer[] };
   registry: DockerImage[];
   db: ManagedPostgres;
-  ci: { runs: CiRun[]; deployments: Deployment[] };
+  ci: { runs: CiRun[]; deployments: Deployment[]; staging?: StagingEnv; canary?: CanaryState; blueGreen?: { activeImage: string; warmImage: string } };
   monitoring: {
     agentInstalled: boolean;
     series: Record<string, MetricPoint[]>;
@@ -293,6 +599,26 @@ export interface World {
   app: AppRuntime;
   /** present once the player provisions it (absent in saves from older versions) */
   lb?: LoadBalancer;
+  /** kubernetes cluster; absent in saves from older versions */
+  k8s?: K8sCluster;
+  /** terraform working state; absent until the player initializes it */
+  tf?: TerraformState;
+  /** company team; absent until the first hire (older saves) */
+  team?: TeamState;
+  /** technical debt ledger; lazily seeded from history */
+  debt?: DebtState;
+  /** service level objectives; defaults exist, "configured" once edited */
+  slos?: SloState;
+  /** multi-cloud provider footprint; absent until the ecosystem phase (older saves) */
+  cloud?: CloudState;
+  /** product portfolio; the catalog is seeded lazily */
+  products?: ProductState;
+  /** FinOps tooling state; created by the FinOps mission or first budget action */
+  finops?: FinOpsState;
+  /** challenge run (P4); absent until the player accepts one */
+  challenge?: ChallengeRunState;
+  /** postmortem tournament standings (P4); seeded by the tournament pack */
+  tournament?: TournamentState;
   economy: { lineItems: CostLineItem[]; payrollMonthly: number; revenueToday: number; costHistory: { day: number; infra: number; revenue: number }[] };
   audit: AuditEvent[];
   flags: Flags;
@@ -310,7 +636,11 @@ export interface GameState {
     hintsUsed: Record<string, number>;
     attempts: Record<string, number>;
     ratings: Record<string, string>;
+    /** active mission-pack mission id (parallel bonus track, P4) */
+    packCurrent?: string;
   };
+  /** activated mission-pack ids (P4) */
+  packs?: string[];
   skills: Record<string, number>;
   xp: number;
 }

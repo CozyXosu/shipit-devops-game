@@ -234,3 +234,44 @@ pre.hl .at { color: #ffa657; }
 .auditview .t { color: var(--dim); margin-right: 8px; }
 .auditview .who { color: var(--purple); margin-right: 8px; }
 .auditview .kind { color: var(--blue); margin-right: 8px; }
+
+/* ---------- Accessibility (P4): high contrast, large text, reduced motion ---------- */
+body.a11y-hc {
+  --bg: #000000;
+  --bg2: #0a0a0a;
+  --panel: #101010;
+  --panel2: #161616;
+  --text: #ffffff;
+  --dim: #c8c8c8;
+  --green: #6ef08e;
+  --red: #ff8d87;
+  --yellow: #ffd66e;
+  --blue: #7cb7ff;
+  --purple: #d3aeff;
+  --orange: #ffa867;
+}
+body.a11y-hc .req.pass .mark, body.a11y-hc .pill.ok { color: var(--green); }
+body.a11y-hc .req.fail .mark { color: var(--dim); }
+
+body.a11y-lg { font-size: 16px; }
+body.a11y-lg .story { font-size: 14.5px; line-height: 1.65; }
+body.a11y-lg .objective { font-size: 15px; }
+body.a11y-lg .coaching { font-size: 14px; }
+body.a11y-lg .req { font-size: 14.5px; }
+body.a11y-lg .dimtxt { font-size: 14px; }
+body.a11y-lg .mlist .m { font-size: 14px; }
+body.a11y-lg button { font-size: 15px; }
+body.a11y-lg .term-in input, body.a11y-lg .term-out { font-size: 15px; }
+body.a11y-lg table.list { font-size: 14.5px; }
+
+body.a11y-rm *, body.a11y-rm *::before, body.a11y-rm *::after {
+  transition: none !important;
+  animation: none !important;
+}
+body.a11y-rm * { scroll-behavior: auto !important; }
+
+/* focus visibility for keyboard navigation */
+button:focus-visible, [role='button']:focus-visible, input:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}

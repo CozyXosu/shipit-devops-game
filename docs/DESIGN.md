@@ -127,11 +127,16 @@ server/src/
     docker.ts         Dockerfile parser + builder + container runtime + registry
     db.ts             Managed Postgres sim: SQL subset, planner (Seq vs Index Scan),
                       indexes, connections, cpu model
-    ci.ts             Pipeline YAML validation + stage runner + deployments
+    ci.ts             Pipeline YAML validation + stage runner + deployments +
+                      staging/e2e/approval gates
+    k8s.ts            Kubernetes sim: manifest apply, pod lifecycle, rolling
+                      updates, HPA, kubectl command engine
+    terraform.ts      HCL subset parser, state, plan/apply/import, drift detection
     metrics.ts        Series store + generators (req rate, error%, p95, cpu, disk…)
     world.ts          Tick engine (1 sim-minute), economy, event scheduler,
-                      incident triggers/resolution, audit
-    net.ts            In-sim HTTP router (curl→nginx→app→db), DNS resolver
+                      incident triggers/resolution (incl. data-loss DR drills),
+                      backups, audit
+    net.ts            In-sim HTTP router (curl→nginx→app→db→k8s), DNS resolver
   missions/
     missions.ts       DATA: 20 missions (14 playable in slice) as typed records
     validators.ts     Requirement checks: pure functions over world state
@@ -216,9 +221,9 @@ The engine polls requirements after every mutating action and each tick;
 the UI renders the live checklist. Completion → rating (S/A/B/C from hints +
 failed attempts + sim-time), reward modal, next mission, audit entry.
 
-## 10. The First 20 Missions
+## 10. The Mission Curriculum (24)
 
-✅ = playable in the shipped vertical slice.
+✅ = playable in the shipped build (P0 + P1 + P2).
 
 | # | Mission | Teaches | Status |
 |---|---|---|---|
@@ -236,12 +241,24 @@ failed attempts + sim-time), reward modal, next mission, audit entry.
 | 12 | **If you can't measure it** | metrics agent, dashboards, alert rules (error%, CPU) | ✅ |
 | 13 | **INCIDENT: the disk that ate the logs** | df/du, ENOSPC forensics, logrotate | ✅ |
 | 14 | **INCIDENT: Friday deploy gone wrong** | error-rate spike, rollback, postmortem + corrective actions | ✅ |
-| 15 | Clicking on purpose | e2e tests, staging environment, approvals | Phase 2 |
-| 16 | One server is a single point of failure | LB, 2nd VM, health checks, HA math | Phase 2 |
-| 17 | Under new management | Terraform: import manual infra to code, plan/apply/drift | Phase 2 |
-| 18 | Pods of plenty | Kubernetes: Deployment/Service/Ingress, probes, HPA | Phase 2 |
-| 19 | The index that saved the bill | EXPLAIN, composite indexes, pooling, read replicas | Phase 2 (engine shipped) |
-| 20 | Out of region, out of mind | backups, RPO/RTO, restore drill, regional failover | Phase 2 |
+| 15 | **The index that saved the bill** | EXPLAIN, Seq→Index scan, live DB-CPU coupling | ✅ |
+| 16 | **One server is a single point of failure** | LB, 2nd VM, health checks, chaos failover drill | ✅ |
+| 17 | **Clicking on purpose** | staging deploys, e2e gates that catch regressions, production approvals | ✅ |
+| 18 | **Under new management** | Terraform: describe+import manual infra, plan/apply, console drift | ✅ |
+| 19 | **Pods of plenty** | Kubernetes: Deployment/Service/Ingress, probes, rolling updates, HPA | ✅ |
+| 20 | **Out of region, out of mind** | backups, data-loss incident, PITR restore, RPO/RTO, postmortem | ✅ |
+| 21 | **The platform team** | hiring, roles & salaries, on-call rotation, being paged | ✅ |
+| 22 | **Paying down the mortgage** | technical-debt ledger, refactoring projects, incident odds | ✅ |
+| 23 | **Canary in the coal mine** | progressive delivery: 10% canary, auto-abort, promotion | ✅ |
+| 24 | **Promises you can keep** | SLOs, error budgets, burn rate, shipping within budget | ✅ |
+| 25 | **Between two clouds** | provider comparison (price × reliability × latency), provider outages, SLA credits | ✅ |
+| 26 | **Moving day** | migration project with a rehearsed cutover (downtime shrinks with preparation) | ✅ |
+| 27 | **The second product** | product portfolio, gated enterprise tier, product MRR | ✅ |
+| 28 | **Where the money goes** | FinOps: budgets, unit economics, rightsizing recommendations, reserved compute | ✅ |
+| 29 | **The content engine** | mission packs: JSON bundles, bonus mission track, tournament activation | ✅ |
+| 30 | **The postmortem tournament** | five scored incident rounds (MTTR, corrective actions, credits, restores) vs rival teams | ✅ |
+| 31 | **The constraints game** | challenge mode: budget cap / windowed availability / RTO under a surprise disaster | ✅ |
+| 32 | **Everyone ships** | accessibility (contrast, text size, motion, keyboard) + interface localization (EN/ES/DE) | ✅ |
 
 ## 11. First Playable Vertical Slice (scope of this delivery)
 
@@ -258,18 +275,36 @@ mission-chain integration test.
 
 ## 12. Phased Roadmap
 
-- **P0 (this delivery):** vertical slice above.
-- **P1 — Platform depth:** Kubernetes sim (Deployments/Services/Ingress/probes/
-  HPA/rolling updates), Terraform sim (HCL subset, plan/apply, drift), load
-  balancer + second VM, backups/restore drill (missions 15–20).
-- **P2 — Operate & Grow:** company sim depth (hiring w/ skill matrices,
-  products, marketing events), technical-debt model, canary/blue-green,
-  PostgreSQL storage backend (`db/schema.sql`), SLOs/error budgets.
-- **P3 — Ecosystem:** fictional cloud providers (Stratus/Volt/Orbit) with
-  regional pricing/reliability tradeoffs, migration projects, FinOps tooling.
-- **P4 — Modes & content at scale:** Challenge mode (budget/availability/RTO
-  constraints), mission pack format (JSON bundles), postmortem tournament,
-  accessibility & localization.
+- **P0 (shipped):** vertical slice — missions 1–14 (Linux → Docker → CI → DB →
+  monitoring → incidents) plus economy, autosave, tutorial/career/sandbox.
+- **P1 (shipped):** platform depth — HA (2nd VM + LB + chaos drill), DB
+  performance (EXPLAIN + index), staging + e2e + approval-gated CI (m17),
+  Terraform sim with drift (m18), Kubernetes sim with probes/rollouts/HPA
+  (m19), backups + data-loss DR drill with RPO/RTO (m20).
+- **P2 (shipped):** operate & grow — team hiring with roles/salaries and an
+  on-call rotation (m21), technical-debt ledger seeded from play history with
+  refactoring projects and incident-probability coupling (m22), canary
+  releases with auto-abort/auto-promote plus blue-green (m23), SLOs with
+  error-budget burn math (m24), marketing campaigns, and an optional
+  PostgreSQL storage backend (`SHIPIT_PG_URL`) behind the async `Storage` seam.
+- **P3 (shipped):** ecosystem — fictional cloud providers (Stratus/Volt/Orbit)
+  with regional pricing/reliability/latency tradeoffs and ambient provider
+  outages with claimable SLA credits (m25), whole-footprint migration projects
+  whose cutover downtime shrinks with preparation (m26), a product portfolio
+  with a gated enterprise tier (m27), and FinOps tooling: budgets with a daily
+  scoreboard, unit economics, utilization-based rightsizing recommendations
+  and reserved-compute commitments (m28).
+- **P4 (shipped):** modes & content at scale — challenge mode (m31): three
+  graded constraint runs (an 18% austerity budget cap, a 99.5% windowed
+  availability audit with pop quizzes, an unannounced database drop with an
+  RTO stopwatch), daily verdicts, scores and stars; mission pack format (m29):
+  JSON bundles with a declarative requirement DSL over world state, a parallel
+  bonus mission track, and packs droppable into `packs/`; the postmortem
+  tournament (m30): the first pack — five live-incident rounds scored on MTTR,
+  corrective actions, SLA credits and restores, against rival teams ticking on
+  a live scoreboard; accessibility & localization (m32): high contrast, large
+  text, reduced motion, Alt+1…9/0 tab navigation, aria-live terminal and
+  status regions, and interface chrome in English/Spanish/German.
 
 ## 13. Definition of Done — slice checklist
 

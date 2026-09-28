@@ -1,15 +1,19 @@
 // World: creation (seed state), the tick engine (simulated time), incidents,
 // economy, cloud-console actions, and audit. This module is the "game engine"
 // the REST API drives.
-import { World, GameState, Incident, AlertRule, MetricPoint, OutLine } from './types';
+import { World, GameState, Incident, AlertRule, MetricPoint, OutLine, Engineer, EngineerRole, RefactorProject, TeamState, DebtState, SloState, CloudState, Product, ProductState, FinOpsState, CostLineItem, ChallengeRunState, TournamentState } from './types';
 import { makeHost, addProcess } from './sim/host';
 import * as fs from './sim/fs';
 import { updateDbCpu, seedTables } from './sim/dbsim';
 import { lbBackends, hostServesApi } from './sim/net';
 import { hashStr } from './sim/docker';
+import { tickK8s, provisionCluster, resizeNodePool, k8sServes } from './sim/k8s';
+import { deployImage } from './sim/ci';
+import { PROVIDERS, providerOf, regionOf, isRegion, costMultiplierOf, latencyMsOf, BASE_LATENCY_MS, plannedDowntimeMin, slaCreditFor, migrationCostOf, MIGRATION_DURATION_MIN } from './sim/cloud';
+import { CHALLENGES, challengeOf, budgetCapOf, windowedAvailability } from './sim/challenges';
 
 /** Flags hold mixed types; arithmetic needs a numeric guard. */
-function num(v: boolean | number | undefined, d = 0): number {
+function num(v: boolean | number | string | undefined, d = 0): number {
   return typeof v === 'number' ? v : d;
 }
 
@@ -212,7 +216,8 @@ export function createWorld(companyName: string, founder: string): World {
     registry: [],
     db: {
       provisioned: false, plan: 'db.small', endpoint: 'db-01.stratus.cloud', version: '16.3',
-      tables: {}, connections: 0, cpuPct: 0, migrationsDone: false, seqScansPerSec: 0
+      tables: {}, connections: 0, cpuPct: 0, migrationsDone: false, seqScansPerSec: 0,
+      backups: { enabled: false, retentionDays: 7, snapshots: [] }
     },
     ci: { runs: [], deployments: [] },
     monitoring: { agentInstalled: false, series: {}, alertRules: [], incidents: [] },
@@ -257,12 +262,13 @@ export function reqRateAt(world: World): number {
   return rate;
 }
 
-function errorSourcesOf(world: World): { n: number; disk: boolean; bad: boolean; db: boolean; drill: boolean } {
+function errorSourcesOf(world: World): { n: number; disk: boolean; bad: boolean; db: boolean; drill: boolean; dataLoss: boolean } {
   const disk = diskUsagePct(world) >= 99.5;
   const bad = Boolean(world.flags.badDeployBug);
   const db = world.db.provisioned && world.db.cpuPct > 90 && !hasStatusIndex(world);
   const drill = Boolean(world.flags.web01Down) && !haReady(world);
-  return { n: (disk ? 2 : 0) + (bad ? 3 : 0) + (db ? 1 : 0) + (drill ? 3 : 0), disk, bad, db, drill };
+  const dataLoss = (world.db.tables['orders']?.rowCount ?? 1) === 0;
+  return { n: (disk ? 2 : 0) + (bad ? 3 : 0) + (db ? 1 : 0) + (drill ? 3 : 0) + (dataLoss ? 4 : 0), disk, bad, db, drill, dataLoss };
 }
 
 /** Can the load balancer survive losing web-01 right now? */
@@ -300,26 +306,42 @@ function tickOne(world: World): void {
 
   // users & revenue
   if (c.launched) {
-    const growthPerMin = (c.users * 0.0042 + 90) * (c.satisfaction / 5) / 1440;
+    let growthPerMin = (c.users * 0.0042 + 90) * (c.satisfaction / 5) / 1440;
+    if (num(world.flags.marketingUntilMin) > world.nowMin) growthPerMin *= 2.5;
     c.users = Math.max(0, c.users + growthPerMin);
     const revenuePerMin = (c.users * 2) / 30 / 1440;
     c.cash += revenuePerMin;
     world.economy.revenueToday += revenuePerMin;
+    // product revenue (P3): launched products bill their share of users
+    const pmrr = productMrrOf(world);
+    if (pmrr > 0) {
+      const pPerMin = pmrr / 30 / 1440;
+      c.cash += pPerMin;
+      world.economy.revenueToday += pPerMin;
+    }
   }
   // costs accrue
   const infraMonthly = monthlyInfraCost(world);
-  c.cash -= (infraMonthly + world.economy.payrollMonthly) / 30 / 1440;
+  c.cash -= (infraMonthly + payrollOf(world)) / 30 / 1440;
 
   // metrics
   const req = reqRateAt(world);
+  tickK8s(world, req);
   const src = errorSourcesOf(world);
   const running = world.app.mode !== 'stopped';
+  // a provider outage or migration cutover takes the whole footprint down
+  const cloudDown = Boolean(world.cloud?.outage) || world.cloud?.migration?.status === 'cutover';
+  const latAdj = latencyMsOf(world.cloud?.provider, world.cloud?.region) - BASE_LATENCY_MS;
   // two healthy backends share the load
   const haScale = haReady(world) ? 0.55 : 1;
-  const cpu = running ? Math.min(98, (6 + req * 0.5 + (src.bad ? 9 : 0) + (world.flags.trafficSpike ? 14 : 0)) * haScale) : 0;
+  const cpu = running && !cloudDown ? Math.min(98, (6 + req * 0.5 + (src.bad ? 9 : 0) + (world.flags.trafficSpike ? 14 : 0)) * haScale) : 0;
   updateDbCpu(world, req);
-  const errorPct = running ? Math.min(80, 0.08 + src.n * 6 + (cpu > 95 ? 1.5 : 0)) : 0;
-  const p95 = running ? Math.round(38 + cpu * 1.6 + world.db.cpuPct * 2.1 + (src.bad ? 2400 : 0) + (src.disk ? 700 : 0) + (cpu > 95 ? 900 : 0)) : 0;
+  const errorPct = running ? (cloudDown ? 80 : Math.min(80, 0.08 + src.n * 6 + (cpu > 95 ? 1.5 : 0))) : 0;
+  const p95 = running
+    ? cloudDown
+      ? 3000 + latAdj
+      : Math.round(38 + latAdj + cpu * 1.6 + world.db.cpuPct * 2.1 + (src.bad ? 2400 : 0) + (src.disk ? 700 : 0) + (cpu > 95 ? 900 : 0))
+    : 0;
   pushPoint(world, 'req_rate', req);
   pushPoint(world, 'error_pct', errorPct);
   pushPoint(world, 'p95_ms', p95);
@@ -390,9 +412,9 @@ function tickOne(world: World): void {
     }
   }
 
-  // satisfaction drift
+  // satisfaction drift (far-away regions slowly annoy users)
   if (c.launched) {
-    const target = errorPct > 5 ? 3.4 : 4.7;
+    const target = errorPct > 5 ? 3.4 : latAdj >= 118 ? 4.5 : 4.7;
     c.satisfaction += (target - c.satisfaction) * 0.01;
   }
 
@@ -408,6 +430,16 @@ function tickOne(world: World): void {
     if (e.kind === 'traffic_spike_end') {
       world.flags.trafficSpike = false;
       audit(world, 'system', 'event', 'Campaign traffic returned to normal levels');
+    }
+    if (e.kind === 'marketing_end') audit(world, 'system', 'marketing', 'Marketing campaign finished — growth back to organic');
+    if (e.kind === 'ambient_incident') openAmbientIncident(world);
+    if (e.kind === 'provider_outage') {
+      if (world.cloud?.outage) {
+        // one at a time — try again shortly so the armed outage still lands
+        world.scheduledEvents.push({ atMin: world.nowMin + 120, kind: 'provider_outage' });
+      } else if (world.cloud) {
+        openProviderOutage(world);
+      }
     }
     if (e.kind === 'new_customer') audit(world, 'system', 'sales', 'New enterprise customer signed — revenue up');
     if (e.kind === 'ha_drill') {
@@ -426,12 +458,94 @@ function tickOne(world: World): void {
         world.scheduledEvents.push({ atMin: world.nowMin + 180, kind: 'ha_drill' }); // try again later
       }
     }
+    if (e.kind === 'tf_drift') {
+      if (world.db.provisioned && world.db.plan !== 'db.micro') {
+        world.db.plan = 'db.micro';
+        audit(world, 'intern (console)', 'cloud', 'DRIFT: someone resized the managed database to db.micro from the console "to save money" — terraform was not used');
+      }
+    }
+    if (e.kind === 'dr_drill') {
+      const orders = world.db.tables['orders'];
+      if (orders && orders.rowCount > 0) {
+        orders.rowCount = 0;
+        openDataLossIncident(world);
+        world.scheduledEvents.push({ atMin: world.nowMin + 240, kind: 'dr_drill_recover' });
+      }
+    }
+    if (e.kind === 'dr_drill_recover') {
+      const inc = world.monitoring.incidents.find((i) => i.kind === 'data_loss' && i.status === 'open');
+      if (inc) {
+        // the player could not restore: provider emergency recovery, painful and slow
+        const orders = world.db.tables['orders'];
+        if (orders) orders.rowCount = 1048576;
+        world.company.cash -= 2000;
+        resolveIncident(world, inc, 'Provider emergency snapshot restored orders after ~19h (RPO breached, $2,000 support fee)');
+        audit(world, 'system', 'incident', 'DATA LOST for good measure: without your own backups the recovery took a support ticket, 19 hours and $2,000.');
+      }
+      if (!world.flags.drRestoreDone) {
+        // the drill will come back — enable backups and prove a clean restore
+        world.scheduledEvents.push({ atMin: world.nowMin + 360, kind: 'dr_drill' });
+      }
+    }
+    if (e.kind === 'tournament_incident') {
+      openIncidentOfKind(world, String(e.payload?.kind ?? 'traffic_spike'));
+    }
+    if (e.kind === 'challenge_disaster') {
+      const run = world.challenge;
+      if (run?.status === 'active' && run.disasterAtMin !== undefined) {
+        const orders = world.db.tables['orders'];
+        if (orders) orders.rowCount = 0;
+        openDataLossIncident(world);
+        audit(world, 'auditors', 'challenge', 'CHALLENGE DISASTER: the orders table was dropped. The RTO clock is running — restore from YOUR backups.');
+        // if the player cannot restore in time, the provider's emergency path closes the round
+        world.scheduledEvents.push({ atMin: world.nowMin + 240, kind: 'challenge_recover_fail' });
+      }
+    }
+    if (e.kind === 'challenge_recover_fail') {
+      const run = world.challenge;
+      const inc = world.monitoring.incidents.find((i) => i.kind === 'data_loss' && i.status === 'open');
+      if (run?.status === 'active' && inc) {
+        const orders = world.db.tables['orders'];
+        if (orders) orders.rowCount = 1048576;
+        world.company.cash -= 2000;
+        resolveIncident(world, inc, 'Provider emergency snapshot restored orders after ~19h (RPO breached, $2,000 support fee)');
+        failChallenge(world, 'RTO blown: no verified restore inside the window — provider emergency recovery took over (19h, $2,000)');
+      }
+    }
   }
-  // ambient events after the build phase
-  if (world.flags.buildPhaseComplete && Math.random() < 0.0009) {
+  // ambient events after the build phase — more likely the deeper the debt
+  if (world.flags.buildPhaseComplete && Math.random() < ambientIncidentChance(world)) {
     const roll = Math.random();
-    if (roll < 0.5) world.scheduledEvents.push({ atMin: world.nowMin + 30, kind: 'traffic_spike' });
+    if (roll < 0.35) world.scheduledEvents.push({ atMin: world.nowMin + 5, kind: 'ambient_incident' });
+    else if (roll < 0.7) world.scheduledEvents.push({ atMin: world.nowMin + 30, kind: 'traffic_spike' });
     else world.scheduledEvents.push({ atMin: world.nowMin + 60, kind: 'new_customer' });
+  }
+
+  // operate phase: canary observation, debt paydown, refactoring projects
+  tickCanary(world);
+  tickCloud(world); // provider outages + migration progression (P3)
+  tickProducts(world); // product builds complete → launch (P3)
+  tickFinops(world); // recommendation resolution + budget tracking (P3)
+  tickChallenge(world); // challenge-mode constraint scoring (P4)
+  tickTournament(world); // rival scoreboard (P4)
+  if (world.debt) {
+    const team = world.team;
+    if (team?.engineers.length) {
+      const perDay = team.engineers.reduce((a, e) => a + (ROLE_INFO[e.role]?.debtPerDay ?? 0.2), 0);
+      if (world.debt.points > 0) world.debt.points = Math.max(0, world.debt.points - perDay / 1440);
+    }
+    for (const p of world.debt.projects) {
+      if (p.startedAtMin !== undefined && !p.done && world.nowMin - p.startedAtMin >= p.durationMin) {
+        p.done = true;
+        world.debt.points = Math.max(0, world.debt.points - p.debtRemoved);
+        world.debt.log.unshift({ atMin: world.nowMin, text: `-${p.debtRemoved}: ${p.label} completed` });
+        if (p.id === 'rm-legacy') {
+          fs.rmNode(world.hosts['web-01'].fs, '/opt/app/legacy-server.js');
+          world.hosts['web-01'].processes = world.hosts['web-01'].processes.filter((pr) => !pr.cmd.includes('legacy-server'));
+        }
+        audit(world, 'system', 'debt', `Refactor complete: ${p.label} (-${p.debtRemoved} debt, now ${Math.round(world.debt.points)})`);
+      }
+    }
   }
 
   // emergent incident triggers
@@ -449,6 +563,8 @@ function tickOne(world: World): void {
   for (const inc of world.monitoring.incidents.filter((x) => x.status === 'open')) {
     if (inc.kind === 'disk_full' && diskUsagePct(world) < 85 && world.flags.logrotateConfigured) resolveIncident(world, inc, 'Disk usage back under 85% with rotation in place');
     if (inc.kind === 'bad_deploy' && !world.flags.badDeployBug && errorPct < 2) resolveIncident(world, inc, 'Error rate recovered after rollback');
+    if (inc.kind === 'data_loss' && (world.db.tables['orders']?.rowCount ?? 0) >= 900000) resolveIncident(world, inc, 'Orders table restored from backup');
+    if (inc.kind === 'traffic_spike' && !world.flags.trafficSpike) resolveIncident(world, inc, 'Traffic surge subsided — capacity held');
   }
 
   // alert evaluation
@@ -468,6 +584,23 @@ function tickOne(world: World): void {
   if (world.nowMin % 1440 === 0) {
     world.economy.costHistory.push({ day: Math.floor(world.nowMin / 1440) + 1, infra: Math.round(infraMonthly / 30), revenue: Math.round(world.economy.revenueToday) });
     world.economy.revenueToday = 0;
+    // FinOps budget scoreboard (P3)
+    if (world.finops?.budgetMonthly) {
+      if (infraMonthly <= world.finops.budgetMonthly) world.finops.daysUnderBudget += 1;
+      else world.finops.daysOverBudget += 1;
+    }
+    // daily backup snapshot (if enabled)
+    const b = world.db.backups;
+    if (world.db.provisioned && b.enabled) {
+      b.snapshots.push({
+        atMin: world.nowMin,
+        label: `snap-day${Math.floor(world.nowMin / 1440) + 1}`,
+        ordersRows: world.db.tables['orders']?.rowCount ?? 0,
+        sizeGB: 2.1
+      });
+      if (b.snapshots.length > b.retentionDays) b.snapshots.splice(0, b.snapshots.length - b.retentionDays);
+      audit(world, 'system', 'db', `Automated backup completed: ${b.snapshots[b.snapshots.length - 1].label} (${(world.db.tables['orders']?.rowCount ?? 0).toLocaleString()} order rows captured)`);
+    }
   }
 }
 
@@ -510,6 +643,7 @@ export function openDiskFullIncident(world: World): void {
   };
   world.monitoring.incidents.unshift(inc);
   audit(world, 'system', 'incident', `PRODUCTION INCIDENT opened: ${inc.title}`);
+  pageOnCall(world, inc);
 }
 
 export function openBadDeployIncident(world: World, image: string): void {
@@ -535,6 +669,7 @@ export function openBadDeployIncident(world: World, image: string): void {
   };
   world.monitoring.incidents.unshift(inc);
   audit(world, 'system', 'incident', `PRODUCTION INCIDENT opened: ${inc.title}`);
+  pageOnCall(world, inc);
   world.audit.push({ t: world.nowMin, actor: 'system', kind: 'incident', text: `Deploy of ${image} marked as the trigger` });
 }
 
@@ -544,6 +679,77 @@ export function resolveIncident(world: World, inc: Incident, note: string): void
   world.company.satisfaction = Math.min(5, world.company.satisfaction + 0.15);
   audit(world, 'system', 'incident', `INCIDENT RESOLVED: ${inc.title} — ${note}`);
   inc.timeline.push({ t: world.nowMin, actor: 'system', text: note });
+}
+
+/** Page the on-call engineer (if any) when an incident opens; SREs halve the damage. */
+export function pageOnCall(world: World, inc: Incident): void {
+  const team = world.team;
+  const onCall = team?.engineers.find((e) => e.id === team.onCallId);
+  addDebt(world, 1, `incident opened: ${inc.title}`);
+  if (!onCall) {
+    inc.timeline.push({ t: world.nowMin, actor: 'system', text: 'NOBODY IS ON CALL — the pager went to the founder. Again.' });
+    return;
+  }
+  world.flags.onCallPaged = true;
+  inc.timeline.push({ t: world.nowMin, actor: onCall.name, text: `paged via on-call rotation — acknowledged in ${onCall.role === 'sre' ? 40 : 180}s` });
+  if (onCall.role === 'sre') inc.customerImpact += ' (SRE on call: impact halved by fast mitigation)';
+  audit(world, onCall.name, 'incident', `${onCall.name} was paged and acknowledged "${inc.title}"`);
+}
+
+/** A minor, self-recovering incident of the operate phase (traffic surge). */
+export function openAmbientIncident(world: World): void {
+  if (world.monitoring.incidents.some((i) => i.status === 'open')) return;
+  const inc: Incident = {
+    id: 'inc-ambient-' + Math.floor(world.nowMin % 100000),
+    kind: 'traffic_spike',
+    title: 'Traffic surge: a big account is hammering the orders API',
+    symptom: 'Request rate jumped ~60% — p95 climbing, CPU rising. Nobody broke anything; the world just happened.',
+    severity: 'SEV2',
+    openedAtMin: world.nowMin,
+    status: 'open',
+    rootCause: 'Organic demand spike (a large customer batch-importing orders).',
+    customerImpact: 'Slower dashboards while the surge lasts; autoscaling should absorb it.',
+    detectedBy: 'traffic alert / metrics',
+    timeline: [],
+    corrective: [
+      { id: 'autoscale', label: 'Have autoscaling absorb the surge (HPA or enough replicas)', done: false },
+      { id: 'trafficalert', label: 'Alert on request-rate spikes', done: false },
+      { id: 'capacity', label: 'Right-size capacity after the surge', done: false }
+    ],
+    postmortemFiled: false
+  };
+  world.monitoring.incidents.unshift(inc);
+  world.flags.trafficSpike = true;
+  world.scheduledEvents.push({ atMin: world.nowMin + 120, kind: 'traffic_spike_end' });
+  audit(world, 'system', 'incident', `INCIDENT opened: ${inc.title}`);
+  pageOnCall(world, inc);
+}
+
+export function openDataLossIncident(world: World): void {
+  if (world.monitoring.incidents.some((i) => i.kind === 'data_loss' && i.status === 'open')) return;
+  const inc: Incident = {
+    id: 'inc-dataloss-' + Math.floor(world.nowMin % 100000),
+    kind: 'data_loss',
+    title: 'DATA LOSS: the orders table was dropped by a migration',
+    symptom: 'A teammate shipped a "cleanup" migration that dropped the orders table. Every order lookup returns empty results — the API is up but the data is gone.',
+    severity: 'SEV1',
+    openedAtMin: world.nowMin,
+    status: 'open',
+    rootCause: 'Destructive migration shipped without a backup safety net: no automated database backups were verified before running it.',
+    customerImpact: 'All order history is unavailable; new orders cannot be recorded while the table is empty.',
+    detectedBy: 'error-rate alert + dashboard showing 0 orders',
+    timeline: [],
+    corrective: [
+      { id: 'restore', label: 'Restore the database from backup (Cloud → Databases)', done: false },
+      { id: 'backups', label: 'Have automated daily backups enabled BEFORE the incident', done: false },
+      { id: 'pitr', label: 'Verify RPO ≤ 24h and record the restore drill RTO', done: false },
+      { id: 'review', label: 'Require a second reviewer on destructive migrations', done: false }
+    ],
+    postmortemFiled: false
+  };
+  world.monitoring.incidents.unshift(inc);
+  audit(world, 'system', 'incident', `PRODUCTION INCIDENT opened: ${inc.title}`);
+  pageOnCall(world, inc);
 }
 
 export function filePostmortem(world: World, incidentId: string, actions: string[]): { ok: boolean; message: string } {
@@ -674,6 +880,62 @@ export function startFailoverDrill(world: World): void {
   world.scheduledEvents.push({ atMin: world.nowMin + 1, kind: 'ha_drill' });
 }
 
+// ------------------------------------------------------------------
+// Cloud: Kubernetes cluster, backups, restore
+// ------------------------------------------------------------------
+export function provisionK8sCluster(world: World): { ok: boolean; message: string } {
+  return provisionCluster(world);
+}
+
+export function enableBackups(world: World, retentionDays = 7): { ok: boolean; message: string } {
+  if (!world.db.provisioned) return { ok: false, message: 'provision the managed database first' };
+  const b = world.db.backups;
+  if (b.enabled) return { ok: false, message: 'automated backups are already enabled' };
+  b.enabled = true;
+  b.enabledAtMin = world.nowMin;
+  b.retentionDays = Math.max(1, Math.min(35, retentionDays));
+  // an initial snapshot runs immediately when backups are first enabled
+  b.snapshots.push({
+    atMin: world.nowMin,
+    label: 'snap-initial',
+    ordersRows: world.db.tables['orders']?.rowCount ?? 0,
+    sizeGB: 2.1
+  });
+  audit(world, world.session.user, 'db', `Automated backups enabled: daily snapshots, ${b.retentionDays}-day retention (first snapshot taken now)`);
+  return { ok: true, message: `daily backups enabled (${b.retentionDays}-day retention) — first snapshot taken` };
+}
+
+export function restoreBackup(world: World): { ok: boolean; message: string } {
+  const b = world.db.backups;
+  if (!world.db.provisioned) return { ok: false, message: 'no managed database provisioned' };
+  if (!b.enabled) return { ok: false, message: 'automated backups are not enabled (Cloud → Databases → Backups)' };
+  const inc = world.monitoring.incidents.find((i) => i.kind === 'data_loss' && i.status === 'open');
+  const incidentAt = inc?.openedAtMin;
+  // point-in-time restore: latest snapshot taken BEFORE the destructive event
+  const usable = incidentAt !== undefined
+    ? [...b.snapshots].reverse().find((s) => s.atMin < incidentAt)
+    : b.snapshots[b.snapshots.length - 1];
+  if (!usable) {
+    return { ok: false, message: 'no snapshot exists from before the data loss — there is nothing to restore from (backups must exist BEFORE disaster strikes)' };
+  }
+  const orders = world.db.tables['orders'];
+  if (orders) orders.rowCount = usable.ordersRows;
+  else seedTables(world);
+  if (inc && incidentAt !== undefined) {
+    const rpoMin = incidentAt - usable.atMin;
+    const rtoMin = world.nowMin - incidentAt;
+    b.lastRestore = { atMin: world.nowMin, fromSnapshotAtMin: usable.atMin, rpoMin, rtoMin };
+    world.flags.drRestoreDone = true;
+    world.flags.drRpoMin = rpoMin;
+    world.flags.drRtoMin = rtoMin;
+    world.flags.drRestoreIncident = inc.id;
+    audit(world, world.session.user, 'db', `RESTORE DRILL: recovered ${usable.ordersRows.toLocaleString()} order rows from ${usable.label} — RPO ${(rpoMin / 60).toFixed(1)}h, RTO ${(rtoMin / 60).toFixed(1)}h`);
+    return { ok: true, message: `restored ${usable.label}: ${usable.ordersRows.toLocaleString()} rows — RPO ${(rpoMin / 60).toFixed(1)}h, RTO ${(rtoMin / 60).toFixed(1)}h` };
+  }
+  audit(world, world.session.user, 'db', `Restored database from ${usable.label} (${usable.ordersRows.toLocaleString()} rows)`);
+  return { ok: true, message: `restored ${usable.label} — ${usable.ordersRows.toLocaleString()} order rows` };
+}
+
 export function addAlertRule(world: World, metric: string, op: AlertRule['op'], threshold: number, forMinutes = 5): AlertRule {
   const labels: Record<string, string> = {
     error_pct: 'Error rate', cpu_pct: 'CPU', db_cpu_pct: 'Database CPU', p95_ms: 'P95 latency',
@@ -694,28 +956,918 @@ export function removeAlertRule(world: World, id: string): void {
 }
 
 // ------------------------------------------------------------------
-// Economy
+// Operate phase: team, technical debt, marketing, SLOs, canary
 // ------------------------------------------------------------------
+const ENGINEER_NAMES = ['Priya', 'Marcus', 'Ana', 'Kenji', 'Zoe', 'Ravi', 'Nadia', 'Tomas', 'Iris', 'Felix', 'Maya', 'Sam'];
+export const ROLE_INFO: Record<string, { label: string; salary: number; blurb: string; debtPerDay: number }> = {
+  junior: { label: 'Junior engineer', salary: 3500, blurb: 'eager, cheap, pays down debt slowly', debtPerDay: 0.15 },
+  mid: { label: 'Mid-level engineer', salary: 6000, blurb: 'steady delivery, steady refactoring', debtPerDay: 0.3 },
+  senior: { label: 'Senior engineer', salary: 9500, blurb: 'fewer shortcuts taken, calmer incidents', debtPerDay: 0.6 },
+  sre: { label: 'SRE', salary: 11000, blurb: 'on-call hero: pages fast, halves customer impact', debtPerDay: 0.5 }
+};
+
+export function ensureTeam(world: World): TeamState {
+  if (!world.team) world.team = { engineers: [], onCallId: null };
+  return world.team;
+}
+
+export function hireEngineer(world: World, role: EngineerRole): { ok: boolean; message: string } {
+  const team = ensureTeam(world);
+  const info = ROLE_INFO[role];
+  if (!info) return { ok: false, message: `unknown role "${role}"` };
+  if (team.engineers.length >= 6) return { ok: false, message: 'the office only fits six engineers' };
+  const taken = new Set(team.engineers.map((e) => e.name));
+  const name = ENGINEER_NAMES.find((n) => !taken.has(n)) ?? ('Eng-' + (team.engineers.length + 1));
+  const eng: Engineer = { id: 'eng-' + hashStr(name + role).slice(0, 6), name, role, salaryMonthly: info.salary, hiredAtMin: world.nowMin };
+  team.engineers.push(eng);
+  audit(world, world.session.user, 'team', `Hired ${name} (${info.label}, $${info.salary}/mo)`);
+  return { ok: true, message: `${name} joined as ${info.label}` };
+}
+
+export function fireEngineer(world: World, id: string): { ok: boolean; message: string } {
+  const team = ensureTeam(world);
+  const eng = team.engineers.find((e) => e.id === id);
+  if (!eng) return { ok: false, message: 'engineer not found' };
+  team.engineers = team.engineers.filter((e) => e.id !== id);
+  if (team.onCallId === id) team.onCallId = null;
+  audit(world, world.session.user, 'team', `${eng.name} left the company`);
+  return { ok: true, message: `${eng.name} left the company` };
+}
+
+export function setOnCall(world: World, engineerId: string | null): { ok: boolean; message: string } {
+  const team = ensureTeam(world);
+  if (engineerId && !team.engineers.some((e) => e.id === engineerId)) return { ok: false, message: 'engineer not found' };
+  team.onCallId = engineerId;
+  const eng = team.engineers.find((e) => e.id === engineerId);
+  audit(world, world.session.user, 'team', eng ? `${eng.name} is now on call` : 'on-call rotation cleared');
+  return { ok: true, message: eng ? `${eng.name} takes the pager` : 'on-call cleared' };
+}
+
+export function payrollOf(world: World): number {
+  const team = world.team;
+  return world.economy.payrollMonthly + (team ? team.engineers.reduce((a, e) => a + e.salaryMonthly, 0) : 0);
+}
+
+// ----- technical debt -----
+const REFACTOR_CATALOG: Omit<RefactorProject, 'done'>[] = [
+  { id: 'rm-legacy', label: 'Delete the legacy server', detail: 'remove /opt/app/legacy-server.js and its process for good', debtRemoved: 8, costCash: 500, durationMin: 120 },
+  { id: 'pipeline-cleanup', label: 'Move manual deploy scripts into CI', detail: 'one pipeline, zero snowflake scripts', debtRemoved: 5, costCash: 1500, durationMin: 360 },
+  { id: 'db-audit', label: 'Database query audit', detail: 'find and index the hot paths before they find you', debtRemoved: 5, costCash: 1200, durationMin: 240 },
+  { id: 'runbooks', label: 'Write on-call runbooks', detail: 'the next 3 a.m. page answers itself', debtRemoved: 4, costCash: 800, durationMin: 180 }
+];
+
+export function ensureDebt(world: World): DebtState {
+  if (world.debt) return world.debt;
+  // seed from the company's actual history: every incident, shortcut and drift
+  let seed = 4;
+  const log: { atMin: number; text: string }[] = [{ atMin: world.nowMin, text: 'baseline entropy of a fast-growing platform' }];
+  const incidents = world.monitoring.incidents.length;
+  if (incidents) { seed += incidents * 2; log.push({ atMin: world.nowMin, text: `${incidents} incident(s) lived through` }); }
+  if (fs.getFile(world.hosts['web-01'].fs, '/opt/app/legacy-server.js')) { seed += 4; log.push({ atMin: world.nowMin, text: 'legacy-server.js still lurks in /opt/app' }); }
+  if (!world.ci.staging?.image) { seed += 4; log.push({ atMin: world.nowMin, text: 'no staging environment in the pipeline' }); }
+  if (world.tf?.driftDetected) { seed += 3; log.push({ atMin: world.nowMin, text: 'unreconciled infrastructure drift' }); }
+  world.debt = { points: seed, log, projects: REFACTOR_CATALOG.map((p) => ({ ...p, done: false })) };
+  return world.debt;
+}
+
+export function addDebt(world: World, points: number, text: string): void {
+  const debt = ensureDebt(world);
+  debt.points += points;
+  debt.log.unshift({ atMin: world.nowMin, text: `+${points}: ${text}` });
+  if (debt.log.length > 40) debt.log.splice(debt.log.length - 30);
+}
+
+export function startRefactorProject(world: World, projectId: string): { ok: boolean; message: string } {
+  const debt = ensureDebt(world);
+  const project = debt.projects.find((p) => p.id === projectId);
+  if (!project) return { ok: false, message: 'unknown project' };
+  if (project.done || project.startedAtMin !== undefined) return { ok: false, message: `${project.label} is already done or running` };
+  if (project.id === 'rm-legacy' && !fs.getFile(world.hosts['web-01'].fs, '/opt/app/legacy-server.js')) return { ok: false, message: 'the legacy server is already gone' };
+  if (world.company.cash < project.costCash) return { ok: false, message: `not enough cash ($${project.costCash} needed)` };
+  world.company.cash -= project.costCash;
+  project.startedAtMin = world.nowMin;
+  audit(world, world.session.user, 'debt', `Refactoring started: ${project.label} (-${project.debtRemoved} debt on completion)`);
+  return { ok: true, message: `${project.label} underway (${Math.round(project.durationMin / 60)}h)` };
+}
+
+/** Ambient incident probability grows with unpaid technical debt. */
+export function ambientIncidentChance(world: World): number {
+  const debt = ensureDebt(world);
+  const seniors = ensureTeam(world).engineers.filter((e) => e.role === 'senior').length;
+  const dampen = Math.max(0.3, 1 - seniors * 0.15);
+  return Math.min(0.004, 0.0009 * (1 + debt.points / 80)) * dampen;
+}
+
+// ----- marketing -----
+export function runMarketingCampaign(world: World): { ok: boolean; message: string } {
+  const cost = 2000;
+  if (world.company.cash < cost) return { ok: false, message: 'not enough cash ($2,000 needed)' };
+  if (num(world.flags.marketingUntilMin) > world.nowMin) return { ok: false, message: 'a campaign is already running' };
+  world.company.cash -= cost;
+  world.flags.marketingUntilMin = world.nowMin + 240;
+  world.scheduledEvents.push({ atMin: world.nowMin + 240, kind: 'marketing_end' });
+  audit(world, world.session.user, 'marketing', 'Marketing campaign launched ($2,000) — expect elevated signups for ~4 sim hours');
+  return { ok: true, message: 'campaign live: user growth boosted for ~4 sim hours' };
+}
+
+// ----- SLOs / error budgets -----
+export function ensureSlos(world: World): SloState {
+  if (!world.slos) world.slos = { configured: false, availabilityTarget: 99.5, p95TargetMs: 600 };
+  return world.slos;
+}
+
+export function configureSlos(world: World, availabilityTarget: number, p95TargetMs: number): { ok: boolean; message: string } {
+  if (!(availabilityTarget >= 90 && availabilityTarget <= 99.95)) return { ok: false, message: 'availability target must be between 90 and 99.95' };
+  if (!(p95TargetMs >= 200 && p95TargetMs <= 5000)) return { ok: false, message: 'p95 target must be between 200 and 5000 ms' };
+  const slos = ensureSlos(world);
+  const first = !slos.configured;
+  slos.availabilityTarget = availabilityTarget;
+  slos.p95TargetMs = p95TargetMs;
+  slos.configured = true;
+  if (first) slos.setAtMin = world.nowMin;
+  audit(world, world.session.user, 'slo', `SLOs ${first ? 'committed' : 'updated'}: availability ≥ ${availabilityTarget}%, p95 < ${p95TargetMs}ms (30-day window)`);
+  return { ok: true, message: `SLOs committed: availability ≥ ${availabilityTarget}%, p95 < ${p95TargetMs}ms` };
+}
+
+export interface SloReport {
+  availability: number;          // current 30d-approx availability %
+  availabilityMet: boolean;
+  p95Avg: number;                // avg p95 over the last hour of sim time
+  p95Met: boolean;
+  budgetAllowedMin: number;      // total bad minutes allowed per 30d
+  budgetBurnedMin: number;
+  budgetRemainingPct: number;
+  burnPerDay: number;            // bad minutes burned per sim day, current rate
+}
+
+export function sloReport(world: World): SloReport {
+  const slos = ensureSlos(world);
+  const availability = uptimePct(world);
+  const recentP95 = (world.monitoring.series.p95_ms ?? []).slice(-60);
+  const p95Avg = recentP95.length ? recentP95.reduce((a, p) => a + p.v, 0) / recentP95.length : 0;
+  const windowMin = 30 * 1440;
+  const allowed = (100 - slos.availabilityTarget) / 100 * windowMin;
+  const burned = num(world.flags.uptimeBadMin);
+  const remaining = Math.max(0, 100 - (allowed > 0 ? (burned / allowed) * 100 : 100));
+  return {
+    availability,
+    availabilityMet: availability >= slos.availabilityTarget,
+    p95Avg: Math.round(p95Avg),
+    p95Met: recentP95.length > 0 && p95Avg < slos.p95TargetMs,
+    budgetAllowedMin: Math.round(allowed * 10) / 10,
+    budgetBurnedMin: Math.round(burned * 10) / 10,
+    budgetRemainingPct: Math.round(remaining * 10) / 10,
+    burnPerDay: Math.round(burned / Math.max(1, (world.nowMin - world.createdAtMin) / 1440) * 100) / 100
+  };
+}
+
+// ----- canary / progressive delivery -----
+// (startCanary lives in sim/ci.ts next to the deploy step that triggers it)
+
+export function promoteCanary(world: World, note = 'observation window passed cleanly'): { ok: boolean; message: string } {
+  const canary = world.ci.canary;
+  if (!canary?.active) return { ok: false, message: 'no canary running' };
+  canary.active = false;
+  canary.status = 'promoted';
+  deployImage(world, canary.image, 'api', 'ci');
+  world.flags.canaryPromoted = true;
+  world.flags.canaryBugLive = false;
+  world.flags.canaryRuntimeBug = false;
+  world.flags.nextDeployHasBug = false;
+  audit(world, 'ci', 'deploy', `Canary PROMOTED to 100%: ${canary.image} (${note})`);
+  return { ok: true, message: `${canary.image} promoted to 100%` };
+}
+
+export function abortCanary(world: World, reason: string): { ok: boolean; message: string } {
+  const canary = world.ci.canary;
+  if (!canary?.active) return { ok: false, message: 'no canary running' };
+  canary.active = false;
+  canary.status = 'aborted';
+  canary.reason = reason;
+  const wasBug = Boolean(world.flags.canaryBugLive);
+  world.flags.canaryBugLive = false;
+  world.flags.canaryRuntimeBug = false;
+  world.flags.nextDeployHasBug = false;
+  if (wasBug) {
+    world.flags.canaryAutoAbort = true;
+    addDebt(world, 1, 'regression reached canary stage (caught automatically)');
+  }
+  audit(world, 'ci', 'deploy', `Canary ABORTED: ${canary.image} — ${reason}. Production was never exposed.`);
+  return { ok: true, message: `canary rolled back automatically — prod untouched (${reason})` };
+}
+
+/** Canary observation, run each sim minute from the tick. */
+function tickCanary(world: World): void {
+  const canary = world.ci.canary;
+  if (!canary?.active) return;
+  const observed = world.nowMin - canary.startedAtMin;
+  if (world.flags.canaryBugLive) {
+    // regression surfaces after ~5 minutes and trips the abort at ~8
+    canary.errorPct = observed < 5 ? 0.2 : Math.min(24, 3 + (observed - 5) * 2.5);
+    if (observed >= 8) abortCanary(world, `error rate ${(canary.errorPct).toFixed(1)}% on canary fleet`);
+    return;
+  }
+  canary.errorPct = Math.max(0.05, (world.monitoring.series.error_pct?.at(-1)?.v ?? 0.1) / 2);
+  if (observed >= 30) promoteCanary(world);
+}
 export function monthlyInfraCost(world: World): number {
   const items = costLineItems(world);
   return items.reduce((a, i) => a + i.monthlyCost, 0);
 }
 
-export function costLineItems(world: World): { category: string; label: string; monthlyCost: number }[] {
-  const items: { category: string; label: string; monthlyCost: number }[] = [
-    { category: 'Compute', label: 'VM m3.medium (web-01)', monthlyCost: 73 },
-    { category: 'Storage', label: `Block volume ${Math.round(world.hosts['web-01'].diskTotalMB / 1024)} GB`, monthlyCost: Math.round(world.hosts['web-01'].diskTotalMB / 10240) }
+/** What the current stack would cost on a given provider+region footprint (list price). */
+export function monthlyInfraCostAt(world: World, providerId: string, regionId: string): number {
+  return baseCostItems(world).reduce((a, i) => a + (i.cloud ? Math.round(i.monthlyCost * costMultiplierOf(providerId, regionId)) : i.monthlyCost), 0);
+}
+
+interface BaseItem { category: string; label: string; monthlyCost: number; cloud: boolean }
+
+/** The stack's line items at list price, before provider/region pricing. */
+function baseCostItems(world: World): BaseItem[] {
+  const items: BaseItem[] = [
+    { category: 'Compute', label: 'VM m3.medium (web-01)', monthlyCost: 73, cloud: true },
+    { category: 'Storage', label: `Block volume ${Math.round(world.hosts['web-01'].diskTotalMB / 1024)} GB`, monthlyCost: Math.round(world.hosts['web-01'].diskTotalMB / 10240), cloud: true }
   ];
-  if (world.hosts['vm-02']) items.push({ category: 'Compute', label: 'VM m3.medium (vm-02)', monthlyCost: 73 });
-  if (world.lb?.provisioned) items.push({ category: 'Networking', label: 'Load balancer lb-01', monthlyCost: 25 });
+  if (world.hosts['vm-02']) items.push({ category: 'Compute', label: 'VM m3.medium (vm-02)', monthlyCost: 73, cloud: true });
+  if (world.k8s?.provisioned) items.push({ category: 'Compute', label: `Kubernetes cluster k8s-01 (${world.k8s.nodes.length} nodes)`, monthlyCost: 1 + 73 * world.k8s.nodes.length, cloud: true });
+  if (world.lb?.provisioned) items.push({ category: 'Networking', label: 'Load balancer lb-01', monthlyCost: 25, cloud: true });
   if (world.db.provisioned) {
-    items.push({ category: 'Database', label: `Managed Postgres (${world.db.plan})`, monthlyCost: world.db.plan === 'db.micro' ? 45 : world.db.plan === 'db.small' ? 120 : 260 });
+    items.push({ category: 'Database', label: `Managed Postgres (${world.db.plan})`, monthlyCost: world.db.plan === 'db.micro' ? 45 : world.db.plan === 'db.small' ? 120 : 260, cloud: true });
+    if (world.db.backups.enabled) items.push({ category: 'Database', label: `Automated backups (${world.db.backups.retentionDays}-day retention)`, monthlyCost: 18, cloud: true });
   }
-  if (world.monitoring.agentInstalled) items.push({ category: 'Monitoring', label: 'Observability agent + 5 GB metrics', monthlyCost: 25 });
+  if (world.ci.staging?.image) items.push({ category: 'CI/CD', label: 'Staging environment runner', monthlyCost: 15, cloud: true });
+  for (const p of world.products?.products ?? []) {
+    if (p.launchedAtMin !== undefined) items.push({ category: 'Products', label: `${p.name} (infra)`, monthlyCost: p.infraMonthly, cloud: true });
+  }
+  if (world.monitoring.agentInstalled) items.push({ category: 'Monitoring', label: 'Observability agent + 5 GB metrics', monthlyCost: 25, cloud: false });
   return items;
+}
+
+export function costLineItems(world: World): CostLineItem[] {
+  const cloud = world.cloud;
+  const mult = cloud ? costMultiplierOf(cloud.provider, cloud.region) : 1;
+  // 1-year reserved compute: 20% off compute while you stay on that provider
+  const reserved = Boolean(cloud && world.finops?.reservedProvider && world.finops.reservedProvider === cloud.provider);
+  return baseCostItems(world).map((i): CostLineItem => {
+    let cost = i.cloud ? Math.round(i.monthlyCost * mult) : i.monthlyCost;
+    if (reserved && i.category === 'Compute') cost = Math.round(cost * 0.8);
+    return {
+      category: i.category,
+      label: i.label,
+      monthlyCost: cost,
+      provider: i.cloud && cloud ? `${cloud.provider}/${cloud.region}` : undefined
+    };
+  });
 }
 
 export function uptimePct(world: World): number {
   const bad = num(world.flags.uptimeBadMin);
   return Math.max(90, 100 - (bad / 43200) * 100);
+}
+
+// ------------------------------------------------------------------
+// Ecosystem phase (P3): multi-cloud providers, migrations, products, FinOps
+// ------------------------------------------------------------------
+export function ensureCloud(world: World): CloudState {
+  if (!world.cloud) {
+    // the company has implicitly been on Stratus all along (see db endpoint)
+    world.cloud = { provider: 'stratus', region: 'us-east-1', sinceMin: world.nowMin, compared: false, outagesSeen: 0, creditsTotal: 0, migrations: [] };
+  }
+  return world.cloud;
+}
+
+/** Price the current stack on every provider × region; gates migration. */
+export function runCloudComparison(world: World): { ok: boolean; message: string; rows?: CloudState['lastComparison'] } {
+  if (!world.cloud) return { ok: false, message: 'the provider market opens with the ecosystem missions (m25)' };
+  const cloud = world.cloud;
+  const rows: NonNullable<CloudState['lastComparison']> = [];
+  for (const p of Object.values(PROVIDERS)) {
+    for (const r of p.regions) {
+      const cost = monthlyInfraCostAt(world, p.id, r.id);
+      let note = '';
+      if (p.id === cloud.provider && r.id === cloud.region) note = 'current footprint';
+      rows.push({ provider: p.id, region: r.id, monthlyCost: cost, note });
+    }
+  }
+  const cheapest = rows.reduce((a, b) => (b.monthlyCost < a.monthlyCost ? b : a));
+  const fastest = rows.reduce((a, b) => (providerOf(b.provider).reliabilityPct > providerOf(a.provider).reliabilityPct ? b : a));
+  for (const row of rows) {
+    if (row === cheapest && !row.note) row.note = 'cheapest';
+    if (row === fastest && row !== cheapest && !row.note) row.note = 'most reliable';
+  }
+  cloud.lastComparison = rows;
+  cloud.compared = true;
+  audit(world, world.session.user, 'cloud', `Provider comparison run: cheapest ${providerOf(cheapest.provider).name} ${regionOf(cheapest.provider, cheapest.region).id} at $${cheapest.monthlyCost}/mo vs current $${monthlyInfraCost(world)}/mo`);
+  return { ok: true, message: `comparison ready — ${rows.length} provider regions priced`, rows };
+}
+
+/** A provider-side region outage: unfixable, timed, and billable. */
+export function openProviderOutage(world: World): void {
+  const cloud = world.cloud;
+  if (!cloud || cloud.outage) return;
+  const provider = providerOf(cloud.provider);
+  const region = regionOf(cloud.provider, cloud.region);
+  const durationMin = 15 + Math.floor(Math.random() * 31);
+  const inc: Incident = {
+    id: 'inc-outage-' + Math.floor(world.nowMin % 100000),
+    kind: 'provider_outage',
+    title: `${provider.name} ${region.id}: region-wide outage`,
+    symptom: `Everything is down and nothing you own is broken: ${provider.name} reports a regional failure (${provider.reliabilityPct}% SLA, and today is why).`,
+    severity: 'SEV1',
+    openedAtMin: world.nowMin,
+    status: 'open',
+    rootCause: `Provider-side failure in ${provider.name} ${region.name}. Nothing in your stack caused it and nothing in your stack can fix it — this is what provider reliability ratings are for.`,
+    customerImpact: `The entire footprint is unreachable for ~${durationMin} minutes. Multi-region failover would have kept serving; today, everyone waits.`,
+    detectedBy: 'error-rate spike + provider status page',
+    timeline: [{ t: world.nowMin, actor: 'system', text: `${provider.name} status page: "elevated error rates in ${region.id}"` }],
+    corrective: [
+      { id: 'credit', label: 'Claim the SLA credit (CLOUD tab — providers pay for their outages)', done: false },
+      { id: 'statuspage', label: 'Check the provider status page before debugging your own stack', done: false },
+      { id: 'migrate', label: 'Evaluate a footprint with better reliability (provider comparison)', done: false }
+    ],
+    postmortemFiled: false
+  };
+  world.monitoring.incidents.unshift(inc);
+  cloud.outage = { provider: cloud.provider, region: cloud.region, startedAtMin: world.nowMin, durationMin, creditClaimed: false, incidentId: inc.id };
+  cloud.outagesSeen += 1;
+  audit(world, 'system', 'incident', `PROVIDER OUTAGE: ${provider.name} ${region.id} is down (${provider.reliabilityPct}% SLA) — ~${durationMin} min, nothing you can fix`);
+  pageOnCall(world, inc);
+}
+
+/** Provider outages + migration progression, run each sim minute. */
+export function tickCloud(world: World): void {
+  const cloud = world.cloud;
+  if (!cloud) return;
+  if (cloud.outage) {
+    const o = cloud.outage;
+    if (o.endedAtMin === undefined && world.nowMin - o.startedAtMin >= o.durationMin) {
+      o.endedAtMin = world.nowMin;
+      const inc = world.monitoring.incidents.find((i) => i.id === o.incidentId);
+      if (inc && inc.status === 'open') resolveIncident(world, inc, `${providerOf(o.provider).name} restored service after ${o.durationMin} min — claim your SLA credit (CLOUD tab)`);
+    }
+    // unclaimed credits expire after a sim day
+    if (o.endedAtMin !== undefined && !o.creditClaimed && world.nowMin - o.endedAtMin > 1440) {
+      audit(world, 'system', 'cloud', `The ${providerOf(o.provider).name} SLA-credit window expired unclaimed — read your provider's terms next time`);
+      cloud.outage = undefined;
+    }
+    return;
+  }
+  const m = cloud.migration;
+  if (m) {
+    const elapsed = world.nowMin - m.startedAtMin;
+    if (m.status === 'running') {
+      const steps = [
+        `provisioning the landing zone on ${providerOf(m.toProvider).name} ${regionOf(m.toProvider, m.toRegion).name}`,
+        'replicating data and container images to the target region',
+        world.ci.staging?.image ? 'rehearsing the cutover against staging' : 'waiting for the cutover window (no staging to rehearse on)'
+      ];
+      const step = Math.min(steps.length - 1, Math.floor((elapsed / m.durationMin) * 3));
+      if (step > m.narrated) {
+        m.narrated = step;
+        audit(world, 'system', 'cloud', `Migration: ${steps[step]}`);
+      }
+      if (elapsed >= m.durationMin) {
+        m.status = 'cutover';
+        m.cutoverEndsAtMin = world.nowMin + m.downtimeMin;
+        audit(world, 'system', 'cloud', `MIGRATION CUTOVER: traffic shifting to ${providerOf(m.toProvider).name} ${regionOf(m.toProvider, m.toRegion).id} — expect ~${m.downtimeMin} min of errors`);
+      }
+    } else if (m.cutoverEndsAtMin !== undefined && world.nowMin >= m.cutoverEndsAtMin) {
+      finishMigration(world);
+    }
+    return;
+  }
+  // ambient provider outage roll (throttled for the first 10h on a new footprint)
+  if (world.nowMin - cloud.sinceMin > 600) {
+    const p = providerOf(cloud.provider);
+    if (Math.random() < p.outageChancePerDay / 1440) openProviderOutage(world);
+  }
+}
+
+function finishMigration(world: World): void {
+  const cloud = world.cloud;
+  const m = cloud?.migration;
+  if (!cloud || !m) return;
+  const fromProvider = cloud.provider;
+  const fromRegion = cloud.region;
+  const costAfter = monthlyInfraCostAt(world, m.toProvider, m.toRegion);
+  cloud.provider = m.toProvider;
+  cloud.region = m.toRegion;
+  cloud.sinceMin = world.nowMin;
+  if (world.db.provisioned) world.db.endpoint = `db-01.${m.toProvider}.cloud`;
+  cloud.migrations.push({ fromProvider, fromRegion, toProvider: m.toProvider, toRegion: m.toRegion, atMin: world.nowMin, downtimeMin: m.downtimeMin, costBefore: m.costBefore, costAfter });
+  cloud.migration = undefined;
+  const delta = Math.round((1 - costAfter / Math.max(1, m.costBefore)) * 100);
+  audit(world, 'system', 'cloud', `Migration complete: ${providerOf(m.toProvider).name} ${regionOf(m.toProvider, m.toRegion).id} now serves everything (cutover ${m.downtimeMin} min of downtime, bill ${delta >= 0 ? '-' : '+'}${Math.abs(delta)}%)`);
+}
+
+export function startMigration(world: World, toProvider: string, toRegion: string): { ok: boolean; message: string } {
+  const cloud = world.cloud;
+  if (!cloud) return { ok: false, message: 'the provider market opens with the ecosystem missions (m25)' };
+  if (cloud.migration) return { ok: false, message: 'a migration is already in flight' };
+  if (cloud.outage && cloud.outage.endedAtMin === undefined) return { ok: false, message: 'the region is down — wait for the outage to end before migrating into a fire' };
+  if (!isRegion(toProvider, toRegion)) return { ok: false, message: `unknown provider/region "${toProvider}/${toRegion}"` };
+  if (toProvider === cloud.provider && toRegion === cloud.region) return { ok: false, message: 'already running there' };
+  if (!cloud.compared) return { ok: false, message: 'run the provider comparison first (CLOUD → Providers) — never migrate blind' };
+  const cost = migrationCostOf(monthlyInfraCost(world));
+  if (world.company.cash < cost) return { ok: false, message: `not enough cash (migration costs $${cost.toLocaleString()})` };
+  const downtime = plannedDowntimeMin(world.db.backups.enabled, Boolean(world.ci.staging?.image), Boolean(world.lb?.provisioned), Boolean(world.k8s?.provisioned));
+  world.company.cash -= cost;
+  cloud.migration = {
+    toProvider, toRegion,
+    startedAtMin: world.nowMin,
+    durationMin: MIGRATION_DURATION_MIN,
+    downtimeMin: downtime,
+    status: 'running',
+    costBefore: monthlyInfraCost(world),
+    narrated: 0
+  };
+  audit(world, world.session.user, 'cloud', `Migration to ${providerOf(toProvider).name} ${regionOf(toProvider, toRegion).id} started ($${cost.toLocaleString()}): ${MIGRATION_DURATION_MIN / 60}h of prep, planned cutover downtime ${downtime} min`);
+  return { ok: true, message: `migration underway — cutover planned at ~${downtime} min of downtime` };
+}
+
+/** Claim the SLA credit for the last provider outage. */
+export function claimSlcCredit(world: World): { ok: boolean; message: string } {
+  const cloud = world.cloud;
+  const o = cloud?.outage;
+  if (!o || o.endedAtMin === undefined) return { ok: false, message: 'no settled provider outage to claim against' };
+  if (o.creditClaimed) return { ok: false, message: 'credit already claimed' };
+  const credit = slaCreditFor(monthlyInfraCost(world), o.durationMin, o.provider);
+  o.creditClaimed = true;
+  world.company.cash += credit;
+  cloud!.creditsTotal += credit;
+  const inc = world.monitoring.incidents.find((i) => i.id === o.incidentId);
+  inc?.timeline.push({ t: world.nowMin, actor: world.session.user, text: `SLA credit claimed: $${credit} (${providerOf(o.provider).name}, ${providerOf(o.provider).creditMultiplier}× credit terms)` });
+  audit(world, world.session.user, 'cloud', `SLA credit claimed from ${providerOf(o.provider).name}: $${credit} for a ${o.durationMin}-minute outage`);
+  cloud!.outage = undefined;
+  return { ok: true, message: `$${credit} SLA credit applied to your account` };
+}
+
+// ----- products -----
+const PRODUCT_CATALOG: Omit<Product, 'startedAtMin' | 'launchedAtMin'>[] = [
+  {
+    id: 'insights', name: 'Insights', tagline: 'analytics dashboards on top of the data you already have',
+    tier: 'addon', pricePerUserMonthly: 0.4, adoptionPct: 25, infraMonthly: 20, buildCost: 800, buildDurationMin: 240
+  },
+  {
+    id: 'shiplink', name: 'ShipLink', tagline: 'webhooks + integrations so customers wire you into everything',
+    tier: 'growth', pricePerUserMonthly: 1.2, adoptionPct: 15, infraMonthly: 45, buildCost: 1600, buildDurationMin: 360
+  },
+  {
+    id: 'ent-grid', name: 'Enterprise Grid', tagline: 'SSO, audit logs, priority support — the tier big contracts require',
+    tier: 'enterprise', pricePerUserMonthly: 6, adoptionPct: 2.5, infraMonthly: 90, buildCost: 3200, buildDurationMin: 480,
+    requires: { slos: true, satisfaction: 4, teamSize: 2 }
+  }
+];
+
+export function ensureProducts(world: World): ProductState {
+  if (!world.products) world.products = { products: PRODUCT_CATALOG.map((p) => ({ ...p })) };
+  return world.products;
+}
+
+/** Why this product cannot be started right now (empty = go). */
+export function productBlockers(world: World, product: Product): string[] {
+  const blockers: string[] = [];
+  if (product.requires?.slos && !world.slos?.configured) blockers.push('enterprise customers need written SLOs first (mission 24)');
+  if (product.requires?.satisfaction && world.company.satisfaction < product.requires.satisfaction) blockers.push(`needs satisfaction ≥ ${product.requires.satisfaction} (yours: ${world.company.satisfaction.toFixed(1)})`);
+  if (product.requires?.teamSize && (world.team?.engineers.length ?? 0) < product.requires.teamSize) blockers.push(`needs ${product.requires.teamSize} engineers to support it`);
+  if (world.company.cash < product.buildCost) blockers.push(`needs $${product.buildCost.toLocaleString()} cash`);
+  return blockers;
+}
+
+export function startProduct(world: World, productId: string): { ok: boolean; message: string } {
+  const state = ensureProducts(world);
+  const product = state.products.find((p) => p.id === productId);
+  if (!product) return { ok: false, message: 'unknown product' };
+  if (product.launchedAtMin !== undefined) return { ok: false, message: `${product.name} is already live` };
+  if (product.startedAtMin !== undefined) return { ok: false, message: `${product.name} is already being built` };
+  const blockers = productBlockers(world, product);
+  if (blockers.length) return { ok: false, message: blockers.join(' · ') };
+  world.company.cash -= product.buildCost;
+  product.startedAtMin = world.nowMin;
+  audit(world, world.session.user, 'product', `Product build started: ${product.name} ($${product.buildCost.toLocaleString()}, ~${Math.round(product.buildDurationMin / 60)}h)`);
+  return { ok: true, message: `${product.name} is being built (~${Math.round(product.buildDurationMin / 60)} sim hours)` };
+}
+
+/** Monthly recurring revenue from launched products, at current user count. */
+export function productMrrOf(world: World): number {
+  return (world.products?.products ?? [])
+    .filter((p) => p.launchedAtMin !== undefined)
+    .reduce((a, p) => a + world.company.users * (p.adoptionPct / 100) * p.pricePerUserMonthly, 0);
+}
+
+/** The core subscription: $2 per user per month. */
+export function baseMrrOf(world: World): number {
+  return world.company.users * 2;
+}
+
+/** Product builds complete → launch, run each sim minute. */
+function tickProducts(world: World): void {
+  for (const p of world.products?.products ?? []) {
+    if (p.startedAtMin !== undefined && p.launchedAtMin === undefined && world.nowMin - p.startedAtMin >= p.buildDurationMin) {
+      p.launchedAtMin = world.nowMin;
+      world.company.satisfaction = Math.min(5, world.company.satisfaction + 0.15);
+      const mrr = world.company.users * (p.adoptionPct / 100) * p.pricePerUserMonthly;
+      audit(world, 'system', 'product', `PRODUCT LAUNCHED: ${p.name} (${p.tier} tier) — ~$${Math.round(mrr).toLocaleString()}/mo from ${p.adoptionPct}% of users, +$${p.infraMonthly}/mo infra`);
+    }
+  }
+}
+
+// ----- FinOps -----
+export function ensureFinops(world: World): FinOpsState {
+  if (!world.finops) world.finops = { daysUnderBudget: 0, daysOverBudget: 0, seen: [], resolved: [] };
+  return world.finops;
+}
+
+/** Captured when the FinOps mission starts, so savings are measured against something real. */
+export function setFinopsBaseline(world: World): void {
+  const f = ensureFinops(world);
+  if (f.baselineMonthly === undefined) {
+    f.baselineMonthly = monthlyInfraCost(world);
+    f.baselineAtMin = world.nowMin;
+  }
+}
+
+export function setFinopsBudget(world: World, monthly: number): { ok: boolean; message: string } {
+  if (!(monthly >= 100 && monthly <= 100000)) return { ok: false, message: 'budget must be between $100 and $100,000 per month' };
+  const f = ensureFinops(world);
+  f.budgetMonthly = Math.round(monthly);
+  f.budgetSetAtMin = world.nowMin;
+  audit(world, world.session.user, 'finops', `Monthly infra budget set: $${f.budgetMonthly.toLocaleString()} (current bill $${monthlyInfraCost(world).toLocaleString()})`);
+  return { ok: true, message: `budget set at $${f.budgetMonthly.toLocaleString()}/mo — the daily scoreboard starts now` };
+}
+
+/** Commit to 1-year reserved compute on the current provider: 20% off, but only while you stay. */
+export function reserveCompute(world: World): { ok: boolean; message: string } {
+  const cloud = world.cloud;
+  if (!cloud) return { ok: false, message: 'the multi-cloud view opens with the ecosystem missions' };
+  const f = ensureFinops(world);
+  if (f.reservedProvider) return { ok: false, message: `already committed to ${providerOf(f.reservedProvider).name} for a year` };
+  f.reservedProvider = cloud.provider;
+  f.reservedAtMin = world.nowMin;
+  audit(world, world.session.user, 'finops', `Reserved compute committed: 1 year on ${providerOf(cloud.provider).name}, 20% off compute — void if you migrate away`);
+  return { ok: true, message: `reserved: 20% off compute on ${providerOf(cloud.provider).name} for a year` };
+}
+
+export interface FinOpsRec {
+  id: string;
+  label: string;
+  detail: string;
+  savingsMonthly: number;
+  action?: { label: string; kind: 'db-small' | 'db-micro' | 'decomm-vm' | 'k8s-pool' | 'reserve' | 'migrate' };
+}
+
+/** Rightsizing recommendations computed from live utilization — pure. */
+export function finopsRecommendations(world: World): FinOpsRec[] {
+  const recs: FinOpsRec[] = [];
+  const mult = world.cloud ? costMultiplierOf(world.cloud.provider, world.cloud.region) : 1;
+  // database: average CPU over the last hour decides if the plan is oversized
+  if (world.db.provisioned && world.db.plan !== 'db.micro') {
+    const recent = (world.monitoring.series.db_cpu_pct ?? []).slice(-60);
+    const avg = recent.length ? recent.reduce((a, p) => a + p.v, 0) / recent.length : 0;
+    if (avg < 25) {
+      const to = world.db.plan === 'db.medium' ? 'db.small' : 'db.micro';
+      const save = world.db.plan === 'db.medium' ? 140 : 75;
+      recs.push({
+        id: `db-${to.replace('db.', '')}`,
+        label: `Downsize the database to ${to}`,
+        detail: `db CPU has averaged ${avg.toFixed(0)}% for the last sim hour — you are paying for headroom nobody uses`,
+        savingsMonthly: Math.round(save * mult),
+        action: { label: `resize → ${to}`, kind: world.db.plan === 'db.medium' ? 'db-small' : 'db-micro' }
+      });
+    }
+  }
+  // vm-02: a relic once kubernetes took over serving
+  if (world.hosts['vm-02'] && (k8sServes(world) || !hostServesApi(world, 'vm-02'))) {
+    recs.push({
+      id: 'decomm-vm',
+      label: 'Decommission vm-02',
+      detail: 'the Kubernetes cluster serves the API now — vm-02 is a $73 relic with a login prompt',
+      savingsMonthly: Math.round(73 * mult),
+      action: { label: 'decommission vm-02', kind: 'decomm-vm' }
+    });
+  }
+  // kubernetes: three nodes for a two-replica workload
+  if (world.k8s?.provisioned && world.k8s.nodes.length >= 3 && Object.values(world.k8s.deployments).every((d) => d.replicas <= 2)) {
+    recs.push({
+      id: 'k8s-pool',
+      label: 'Scale the node pool 3 → 2',
+      detail: 'every deployment runs ≤2 replicas — the third node is idle insurance',
+      savingsMonthly: Math.round(73 * mult),
+      action: { label: 'scale pool to 2 nodes', kind: 'k8s-pool' }
+    });
+  }
+  // reserved pricing
+  const f = world.finops;
+  if (f && !f.reservedProvider) {
+    const compute = baseCostItems(world).filter((i) => i.category === 'Compute').reduce((a, i) => a + i.monthlyCost, 0);
+    recs.push({
+      id: 'reserve-compute',
+      label: 'Commit to 1-year reserved compute',
+      detail: `20% off compute in exchange for staying put on ${world.cloud ? providerOf(world.cloud.provider).name : 'your provider'} for a year — savings plans reward stability`,
+      savingsMonthly: Math.round(compute * mult * 0.2),
+      action: { label: 'reserve 1 year', kind: 'reserve' }
+    });
+  }
+  // provider arbitrage
+  if (world.cloud && world.cloud.provider === 'stratus' && world.cloud.region === 'us-east-1') {
+    const voltCost = monthlyInfraCostAt(world, 'volt', 'us-central-1');
+    const now = monthlyInfraCost(world);
+    if (voltCost < now) {
+      recs.push({
+        id: 'migrate-volt',
+        label: 'Evaluate Volt us-central-1',
+        detail: `same stack for ~$${voltCost.toLocaleString()}/mo instead of $${now.toLocaleString()} — but the SLA is 99.5% and outages are ~3.6× likelier`,
+        savingsMonthly: now - voltCost,
+        action: { label: 'plan the migration', kind: 'migrate' }
+      });
+    }
+  }
+  return recs;
+}
+
+/** Recommendation tracking: a rec that vanishes from the list was acted on. */
+function tickFinops(world: World): void {
+  const f = world.finops;
+  if (!f) return;
+  const ids = finopsRecommendations(world).map((r) => r.id);
+  for (const id of f.seen) {
+    if (!ids.includes(id) && !f.resolved.includes(id)) f.resolved.push(id);
+  }
+  f.seen = ids;
+}
+
+/** Remove a provisioned VM and everything running on it. */
+export function decommissionVm(world: World, hostId: string): { ok: boolean; message: string } {
+  if (hostId === 'web-01') return { ok: false, message: 'web-01 is the original box — it stays' };
+  const host = world.hosts[hostId];
+  if (!host) return { ok: false, message: 'no such VM' };
+  delete world.hosts[hostId];
+  world.docker.containers = world.docker.containers.filter((c) => (c.hostId ?? 'web-01') !== hostId);
+  if (world.session.hostId === hostId) {
+    world.session.hostId = 'laptop';
+    world.session.cwd = '/Users/you';
+    world.session.pending = null;
+  }
+  audit(world, world.session.user, 'cloud', `Decommissioned ${hostId} (${host.ip}) — containers retired, $${Math.round(73 * (world.cloud ? costMultiplierOf(world.cloud.provider, world.cloud.region) : 1))}/mo saved`);
+  return { ok: true, message: `${hostId} decommissioned` };
+}
+
+// ------------------------------------------------------------------
+// Modes & content at scale (P4): challenges, packs/tournament, access
+// ------------------------------------------------------------------
+
+/** Open a specific incident kind on demand (tournament rounds, packs). */
+export function openIncidentOfKind(world: World, kind: string): void {
+  switch (kind) {
+    case 'disk_full':
+      openDiskFullIncident(world);
+      break;
+    case 'bad_deploy':
+      // arm the regression so the incident stays open until a rollback
+      world.flags.badDeployBug = true;
+      world.flags.badDeployAtMin = world.nowMin;
+      openBadDeployIncident(world, world.app.image ?? 'registry/api:v1.9.0');
+      break;
+    case 'traffic_spike':
+      openAmbientIncident(world);
+      break;
+    case 'data_loss': {
+      const orders = world.db.tables['orders'];
+      if (orders) orders.rowCount = 0;
+      openDataLossIncident(world);
+      break;
+    }
+    case 'provider_outage':
+      openProviderOutage(world);
+      break;
+    default:
+      openAmbientIncident(world);
+  }
+}
+
+// ----- postmortem tournament -----
+
+/** Seed the rival scoreboard the moment the tournament pack activates. */
+export function ensureTournament(world: World): TournamentState {
+  if (!world.tournament) {
+    world.tournament = {
+      joinedAtMin: world.nowMin,
+      points: 0,
+      roundsWon: 0,
+      rivals: [
+        { name: 'Cloud Nine', points: 0 },
+        { name: 'Null Pointers', points: 0 },
+        { name: 'Ping Payments', points: 0 }
+      ],
+      finished: false
+    };
+    audit(world, 'system', 'tournament', 'POSTMORTEM TOURNAMENT: you are on the board against Cloud Nine, Null Pointers and Ping Payments. Live standings in the MODES tab.');
+  }
+  return world.tournament;
+}
+
+/** Rivals play the same gauntlet: they score steadily while the clock runs. */
+function tickTournament(world: World): void {
+  const t = world.tournament;
+  if (!t || t.finished) return;
+  const last = t.lastRivalTickMin ?? t.joinedAtMin;
+  if (world.nowMin - last < 15) return;
+  t.lastRivalTickMin = world.nowMin;
+  for (const r of t.rivals) {
+    r.points = Math.round((r.points + 0.25 + Math.random() * 0.2) * 10) / 10;
+  }
+}
+
+/** Freeze the board and place the player (1 = champion). */
+export function finishTournament(world: World): void {
+  const t = world.tournament;
+  if (!t || t.finished) return;
+  t.finished = true;
+  t.place = 1 + t.rivals.filter((r) => r.points > t.points).length;
+  if (t.place === 1) {
+    audit(world, 'system', 'tournament', `TOURNAMENT CHAMPION — ${t.points} points vs ${t.rivals.map((r) => `${r.name} ${r.points}`).join(', ')}. The trophy is a postmortem template. Frame it.`);
+  } else {
+    audit(world, 'system', 'tournament', `Tournament finished in place ${t.place} (${t.points} points). The winners recovered faster and wrote it down — next season is another chance.`);
+  }
+}
+
+/** Player settings from the Access & language panel (P4 mission flags). */
+export function setPlayerSettings(world: World, opts: { locale?: string; highContrast?: boolean; largeText?: boolean; reducedMotion?: boolean }): { ok: boolean; message: string } {
+  const changes: string[] = [];
+  if (opts.locale !== undefined && typeof opts.locale === 'string' && ['en', 'es', 'de'].includes(opts.locale)) {
+    world.flags.locale = opts.locale;
+    changes.push(`language: ${opts.locale}`);
+  }
+  const toggles: [keyof typeof opts, string][] = [['highContrast', 'a11yHighContrast'], ['largeText', 'a11yLargeText'], ['reducedMotion', 'a11yReducedMotion']];
+  for (const [opt, flag] of toggles) {
+    const v = opts[opt];
+    if (v === undefined) continue;
+    world.flags[flag] = Boolean(v);
+    changes.push(`${flag}: ${Boolean(v)}`);
+  }
+  if (world.flags.a11yHighContrast || world.flags.a11yLargeText || world.flags.a11yReducedMotion) world.flags.a11yUsed = true;
+  if (typeof world.flags.locale === 'string' && world.flags.locale !== 'en') world.flags.localeUsed = true;
+  if (!changes.length) return { ok: false, message: 'nothing to change' };
+  return { ok: true, message: `settings saved (${changes.join(', ')})` };
+}
+
+// ----- challenge mode -----
+
+export function startChallenge(world: World, challengeId: string): { ok: boolean; message: string } {
+  if (world.challenge?.status === 'active') return { ok: false, message: 'a challenge is already running — finish or abandon it first' };
+  const def = challengeOf(challengeId);
+  if (!def) return { ok: false, message: `unknown challenge "${challengeId}"` };
+  if (!world.flags.sandbox && !world.flags.ecosystemPhaseComplete) {
+    return { ok: false, message: 'challenges open after mission 28 (or in sandbox) — the endgame assumes the whole toolbox' };
+  }
+  const run: ChallengeRunState = {
+    id: def.id,
+    startedAtMin: world.nowMin,
+    durationMin: Math.round(def.durationDays * 1440),
+    status: 'active',
+    days: []
+  };
+  if (def.rule === 'budget') {
+    run.billAtStart = monthlyInfraCost(world);
+    run.capMonthly = budgetCapOf(def, run.billAtStart);
+  }
+  if (def.rule === 'availability') {
+    run.badMinAtStart = num(world.flags.uptimeBadMin);
+    // the auditors brought a pop quiz
+    world.scheduledEvents.push({ atMin: world.nowMin + 200, kind: 'ha_drill' });
+    world.scheduledEvents.push({ atMin: world.nowMin + 600, kind: 'traffic_spike' });
+  }
+  if (def.rule === 'rto') {
+    const [lo, hi] = def.disasterWindowMin ?? [180, 540];
+    run.disasterAtMin = world.nowMin + lo + Math.floor(Math.random() * (hi - lo));
+    world.scheduledEvents.push({ atMin: run.disasterAtMin, kind: 'challenge_disaster' });
+  }
+  world.challenge = run;
+  world.flags.challengesStarted = num(world.flags.challengesStarted) + 1;
+  audit(world, world.session.user, 'challenge', `CHALLENGE ACCEPTED: ${def.name} — ${def.ruleLabel} (scoreboard in the MODES tab)`);
+  return { ok: true, message: `${def.name} underway — ${def.ruleLabel}` };
+}
+
+export function abandonChallenge(world: World): { ok: boolean; message: string } {
+  const run = world.challenge;
+  if (!run || run.status !== 'active') return { ok: false, message: 'no active challenge' };
+  failChallenge(world, 'abandoned by the operator');
+  return { ok: true, message: 'challenge abandoned — the scoreboard keeps the scar' };
+}
+
+function passChallenge(world: World, score: number, verdict: string): void {
+  const run = world.challenge;
+  if (!run || run.status !== 'active') return;
+  run.status = 'passed';
+  run.score = Math.round(score * 100) / 100;
+  run.verdict = verdict;
+  world.flags.challengesPassed = num(world.flags.challengesPassed) + 1;
+  world.company.cash += 5000;
+  audit(world, 'system', 'challenge', `CHALLENGE PASSED: ${verdict} (+$5,000 prize money)`);
+}
+
+function failChallenge(world: World, verdict: string): void {
+  const run = world.challenge;
+  if (!run || run.status !== 'active') return;
+  run.status = 'failed';
+  run.verdict = verdict;
+  audit(world, 'system', 'challenge', `CHALLENGE FAILED: ${verdict}`);
+}
+
+/** Live constraint readouts for the scoreboard (used by the API view). */
+export function challengeLive(world: World): {
+  billNow: number; capMonthly: number | null; windowedAvailabilityPct: number | null;
+  badMinutes: number; minutesElapsed: number; restoredAfterDisaster: boolean;
+} | null {
+  const run = world.challenge;
+  if (!run) return null;
+  const def = challengeOf(run.id);
+  if (!def) return null;
+  const elapsed = world.nowMin - run.startedAtMin;
+  const bad = Math.max(0, num(world.flags.uptimeBadMin) - (run.badMinAtStart ?? 0));
+  return {
+    billNow: monthlyInfraCost(world),
+    capMonthly: run.capMonthly ?? null,
+    windowedAvailabilityPct: def.rule === 'availability' ? Math.round(windowedAvailability(bad, elapsed) * 100) / 100 : null,
+    badMinutes: Math.round(bad),
+    minutesElapsed: elapsed,
+    restoredAfterDisaster: run.disasterAtMin !== undefined
+      ? Boolean(world.flags.drRestoreDone && (world.db.tables['orders']?.rowCount ?? 0) >= 900000)
+      : false
+  };
+}
+
+/** Daily constraint grading + RTO early pass/fail, run each sim minute. */
+function tickChallenge(world: World): void {
+  const run = world.challenge;
+  if (!run || run.status !== 'active') return;
+  const def = challengeOf(run.id);
+  if (!def) return;
+  const elapsed = world.nowMin - run.startedAtMin;
+
+  if (def.rule === 'rto') {
+    // early pass the moment a valid restore lands after the disaster
+    if (run.disasterAtMin !== undefined && world.nowMin > run.disasterAtMin) {
+      const rto = typeof world.flags.drRtoMin === 'number' && world.flags.drRestoreDone ? world.flags.drRtoMin : null;
+      const restoredRows = (world.db.tables['orders']?.rowCount ?? 0) >= 900000;
+      const rpoOk = typeof world.flags.drRpoMin === 'number' ? world.flags.drRpoMin <= 1440 : false;
+      if (rto !== null && restoredRows && rpoOk) {
+        passChallenge(world, rto, `restored in ${rto} min (target \u2264 ${def.rtoTargetMin}, RPO ${(num(world.flags.drRpoMin) / 60).toFixed(1)}h)`);
+        return;
+      }
+    }
+  }
+
+  // daily verdicts
+  const dayDue = Math.floor(elapsed / 1440);
+  if (dayDue >= 1 && run.days.length < dayDue) {
+    const day = run.days.length + 1;
+    if (def.rule === 'budget') {
+      const bill = monthlyInfraCost(world);
+      const cap = run.capMonthly ?? Infinity;
+      const ok = bill <= cap;
+      run.days.push({ day, ok, detail: `day ${day}: $${bill}/mo vs cap $${cap}/mo` });
+      if (!ok) {
+        failChallenge(world, `day ${day} over the austerity cap: $${bill}/mo vs $${cap}/mo allowed`);
+        return;
+      }
+    } else if (def.rule === 'availability') {
+      const bad = Math.max(0, num(world.flags.uptimeBadMin) - (run.badMinAtStart ?? 0));
+      const avail = windowedAvailability(bad, Math.min(elapsed, run.durationMin));
+      const floor = def.availabilityFloorPct ?? 99.5;
+      run.days.push({ day, ok: avail >= floor, detail: `day ${day}: ${avail.toFixed(2)}% windowed vs floor ${floor}%` });
+      if (avail < floor) {
+        failChallenge(world, `day ${day}: windowed availability ${avail.toFixed(2)}% below the ${floor}% floor`);
+        return;
+      }
+    } else {
+      run.days.push({ day, ok: true, detail: `day ${day}: disaster survived so far` });
+    }
+  }
+
+  // final verdict at the window's end
+  if (elapsed >= run.durationMin) {
+    if (def.rule === 'budget') {
+      const bill = monthlyInfraCost(world);
+      const cap = run.capMonthly ?? Infinity;
+      if (bill <= cap) {
+        const start = run.billAtStart ?? bill;
+        const score = start > 0 ? Math.round((1 - bill / start) * 10000) / 100 : 0; // cut achieved, %
+        passChallenge(world, score, `held the bill at $${bill}/mo against a $${cap}/mo cap`);
+      } else {
+        failChallenge(world, `final day over the cap: $${bill}/mo vs $${cap}/mo`);
+      }
+    } else if (def.rule === 'availability') {
+      const bad = Math.max(0, num(world.flags.uptimeBadMin) - (run.badMinAtStart ?? 0));
+      const avail = windowedAvailability(bad, run.durationMin);
+      passChallenge(world, avail, `${avail.toFixed(2)}% windowed availability over ${def.durationDays} days`);
+    } else {
+      const rto = typeof world.flags.drRtoMin === 'number' && world.flags.drRestoreDone ? world.flags.drRtoMin : null;
+      if (rto !== null && rto <= (def.rtoTargetMin ?? 120) && (world.db.tables['orders']?.rowCount ?? 0) >= 900000) {
+        passChallenge(world, rto, `restored in ${rto} min`);
+      } else {
+        failChallenge(world, 'window closed without a verified in-time restore');
+      }
+    }
+  }
 }

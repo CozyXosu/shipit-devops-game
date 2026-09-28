@@ -20,6 +20,7 @@ export function loadPipeline(world: World, repoPath: string, relFile: string): P
   if (!doc || typeof doc !== 'object') { p.problems.push('YAML root must be a mapping'); return p; }
   p.name = typeof doc.name === 'string' ? doc.name : 'pipeline';
   p.on = typeof doc.on === 'string' ? doc.on : 'push';
+  p.strategy = typeof doc.strategy === 'string' ? doc.strategy : undefined;
   const stepsRaw = doc.steps;
   if (!Array.isArray(stepsRaw)) { p.problems.push('missing "steps:" list'); return p; }
   let i = 0;
@@ -59,10 +60,8 @@ export function runPipeline(world: World, pipelinePath: string): CiRun {
   const repoPath = repo?.path ?? '/opt/app';
   const pipeline = loadPipeline(world, repoPath, pipelinePath);
   const headSha = repo ? (repo.branches[repo.head]?.commit ?? 'unknown') : 'no-repo';
-  let lastBuiltTag: string | null = null;
-  let pushedTag: string | null = null;
   const run: CiRun = {
-    id: 'run-' + hashStr(pipelinePath + world.nowMin).slice(0, 6),
+    id: 'run-' + hashStr(pipelinePath + world.nowMin + world.ci.runs.length).slice(0, 6),
     startedAtMin: world.nowMin,
     pipelinePath,
     commitSha: headSha,
@@ -73,27 +72,134 @@ export function runPipeline(world: World, pipelinePath: string): CiRun {
   world.ci.runs.push(run);
   if (world.ci.runs.length > 30) world.ci.runs.splice(0, world.ci.runs.length - 25);
 
+  processSteps(world, run, pipeline.steps, { repoPath, headSha, strategy: pipeline.strategy });
+  return run;
+}
+
+/** Canary deploy: ship to 10% of traffic and watch before promoting. */
+export function startCanary(world: World, image: string): void {
+  world.ci.canary = { active: true, image, startedAtMin: world.nowMin, trafficPct: 10, errorPct: 0, status: 'running' };
+  // an armed regression surfaces on the canary after a few minutes — a
+  // runtime-only bug (m23) slips past staging e2e and only shows under traffic
+  world.flags.canaryBugLive = Boolean(world.flags.nextDeployHasBug) || Boolean(world.flags.canaryRuntimeBug);
+  world.flags.canaryConfigured = true;
+  world.audit.push({ t: world.nowMin, actor: 'ci', kind: 'deploy', text: `Canary live: ${image} at 10% of traffic — watching error rate for 30 sim minutes` });
+}
+
+/** Approve or reject a run that is waiting on the production approval gate. */
+export function approveRun(world: World, runId: string, approve: boolean): { ok: boolean; message: string } {
+  const run = world.ci.runs.find((r) => r.id === runId);
+  if (!run) return { ok: false, message: 'run not found' };
+  if (run.status !== 'waiting_approval') return { ok: false, message: `run is ${run.status}, not waiting for approval` };
+  const pending = run.pendingSteps ?? [];
+  run.pendingSteps = [];
+  const stage = run.stages[run.stages.length - 1];
+  if (!approve) {
+    if (stage) stage.log.push('Deployment rejected by reviewer — pipeline cancelled');
+    run.status = 'rejected';
+    world.audit.push({ t: world.nowMin, actor: world.session.user, kind: 'ci', text: `Production deploy REJECTED (run ${run.id})` });
+    return { ok: true, message: 'run rejected — production was not touched' };
+  }
+  if (stage) stage.log.push(`Approved by ${world.session.user} at ${new Date().toISOString().slice(11, 16)} UTC`);
+  world.flags.ciApprovalUsed = true;
+  world.audit.push({ t: world.nowMin, actor: world.session.user, kind: 'ci', text: `Production deploy APPROVED (run ${run.id})` });
+  const repo = findRepoFor(world, '/opt/app');
+  const pipeline = loadPipeline(world, repo?.path ?? '/opt/app', run.pipelinePath);
+  processSteps(world, run, pending, { repoPath: repo?.path ?? '/opt/app', headSha: run.commitSha, strategy: pipeline.strategy });
+  return { ok: true, message: `approved — run ${run.id} continued` };
+}
+
+interface StepCtx { repoPath: string; headSha: string; strategy?: string }
+
+/** Execute pipeline steps, appending stages to the run. Stops on failure or approval gate. */
+function processSteps(world: World, run: CiRun, steps: PipelineStep[], ctx: StepCtx): void {
+  const { repoPath, headSha } = ctx;
+  run.status = 'running';
+  let lastBuiltTag: string | null = null;
+  let pushedTag: string | null = null;
+  // remember what earlier stages of THIS run produced (resume case)
+  for (const st of run.stages) {
+    const m = /Built (\S+) /.exec(st.log.join('\n'));
+    if (m) lastBuiltTag = m[1];
+    const p = /pushed (\S+)/.exec(st.log.join('\n'));
+    if (p) pushedTag = p[1];
+  }
+
   const finish = (status: 'success' | 'failed') => {
     run.status = status;
-    world.audit.push({ t: world.nowMin, actor: 'ci', kind: 'ci', text: `Pipeline ${status === 'success' ? 'succeeded' : 'failed'} (${pipelinePath})` });
+    world.audit.push({ t: world.nowMin, actor: 'ci', kind: 'ci', text: `Pipeline ${status === 'success' ? 'succeeded' : 'failed'} (${run.pipelinePath})` });
   };
 
-  for (const step of pipeline.steps) {
+  /** On failure the remaining steps show up as skipped, like a real runner. */
+  const failRemaining = (fromIdx: number) => {
+    for (const s of steps.slice(fromIdx + 1)) run.stages.push({ name: s.name, status: 'skipped', log: [] });
+  };
+
+  for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+    const step = steps[stepIdx];
     const stage: CiRun['stages'][number] = { name: step.name, status: 'success', log: [] };
     run.stages.push(stage);
     const log = stage.log;
-    const kindOf = (step.uses ?? '') + ' ' + (step.run ?? '');
+    const isStagingDeploy = (/staging/i.test(step.name) || /staging/i.test(step.run ?? '') || (step.uses ?? '').includes('deploy-staging')) && /deploy/i.test(step.name + (step.uses ?? '') + (step.run ?? ''));
+    const isE2e = /e2e|end-to-end|end.to.end/i.test(step.name) || /e2e|end-to-end/.test(step.run ?? '');
+    const isApproval = (step.uses ?? '').includes('approval');
+
     if ((step.uses ?? '').includes('checkout')) {
       log.push(`HEAD is now at ${headSha.slice(0, 7)}`);
-      log.push(`Checked out ${repoPath} (${repo ? Object.keys(repo.commits).length : 0} commits)`);
+      log.push(`Checked out ${repoPath}`);
+    } else if (isApproval) {
+      log.push('⏸ Waiting for production approval…');
+      log.push('This pipeline ships to PRODUCTION only after a human approves.');
+      run.status = 'waiting_approval';
+      run.pendingSteps = steps.slice(steps.indexOf(step) + 1);
+      run.image = pushedTag ?? lastBuiltTag ?? undefined;
+      world.audit.push({ t: world.nowMin, actor: 'ci', kind: 'ci', text: `Pipeline paused: production approval required (run ${run.id})` });
+      return;
+    } else if (isStagingDeploy) {
+      const image = pushedTag ?? lastBuiltTag;
+      if (!image) { log.push('no image to deploy to staging: build/push must run first'); stage.status = 'failed'; failRemaining(stepIdx); break; }
+      if (!world.ci.staging) world.ci.staging = { image: null, deployedAtMin: 0, e2ePassed: false, e2eLog: [] };
+      world.ci.staging.image = image;
+      world.ci.staging.deployedAtMin = world.nowMin;
+      world.ci.staging.e2ePassed = false;
+      log.push(`Deploying ${image} to staging (staging.acme.internal)…`);
+      log.push('Staging container healthy after 4.1s');
+      world.audit.push({ t: world.nowMin, actor: 'ci', kind: 'ci', text: `Deployed ${image} to STAGING` });
+    } else if (isE2e) {
+      const staging = world.ci.staging;
+      if (!staging?.image) { log.push('e2e needs a staging deploy step first'); stage.status = 'failed'; failRemaining(stepIdx); break; }
+      log.push('> playwright test --config e2e/staging.config.ts');
+      log.push('');
+      if (world.flags.nextDeployHasBug) {
+        // regression caught in staging: production is never touched
+        stage.status = 'failed';
+        world.flags.nextDeployHasBug = false;
+        world.flags.stagingCaughtBug = true;
+        world.flags.stagingCaughtAtMin = world.nowMin;
+        world.flags.stagingCaughtDeployId = world.ci.deployments.find((d) => d.active)?.id ?? '';
+        log.push('  1) [chromium] › orders › shows the order history  …  FAILED');
+        log.push('     Error: expect(received).toHaveLength(48213) — received 0');
+        log.push('');
+        log.push('  1 failed, 22 passed (14.8s)');
+        log.push('PRODUCTION WAS NOT TOUCHED. The regression was caught in staging.');
+        staging.e2eLog = [...log];
+        world.audit.push({ t: world.nowMin, actor: 'ci', kind: 'ci', text: 'E2E in staging CAUGHT a regression — production deploy blocked' });
+        failRemaining(stepIdx);
+        break;
+      }
+      log.push('  23 passed (12.4s)');
+      log.push('staging verified end-to-end');
+      staging.e2ePassed = true;
+      staging.e2eLog = [...log];
     } else if (/npm\s+test/.test(step.run ?? '')) {
       log.push('> api@1.0.0 test');
       log.push('> vitest run');
       log.push('');
       log.push(' 48 passing (3.1s)');
       if (world.flags.badCodeSeeded) {
-        log.push(' 1 failing: orders endpoint returns 500 under load', 'FAILED');
+        log.push(' 1 failing: orders endpoint returns 500 under load');
         stage.status = 'failed';
+        failRemaining(stepIdx);
         break;
       }
     } else if (/npm\s+(run\s+)?build|npm\s+ci/.test(step.run ?? '')) {
@@ -108,25 +214,45 @@ export function runPipeline(world: World, pipelinePath: string): CiRun {
         .replace('$GITHUB_SHA', headSha.slice(0, 7));
       const res = buildImage(world, tag, `${repoPath}/Dockerfile`);
       log.push(...res.lines.map((l) => l.text));
-      if (!res.ok) { stage.status = 'failed'; break; }
-      stage.log.push(`Built ${tag} (${res.image?.sizeMB}MB)`);
+      if (!res.ok) { stage.status = 'failed'; failRemaining(stepIdx); break; }
+      log.push(`Built ${tag} (${res.image?.sizeMB}MB)`);
       lastBuiltTag = tag;
-    } else if (/^docker\s+push/.test(step.run ?? '') || /push/.test(step.name)) {
+    } else if (/^docker\s+push/.test(step.run ?? '') || (/push/.test(step.name) && !/push/i.test(step.uses ?? 'x'))) {
       const tag = lastBuiltTag ?? /docker\s+push\s+(\S+)/.exec(step.run ?? '')?.[1] ?? null;
-      if (!tag) { log.push('no image to push: build step must run first'); stage.status = 'failed'; break; }
+      if (!tag) { log.push('no image to push: build step must run first'); stage.status = 'failed'; failRemaining(stepIdx); break; }
       log.push(...pushToRegistry(world, tag).map((l) => l.text));
+      log.push(`pushed ${tag}`);
       pushedTag = tag;
-    } else if (/deploy/.test(step.name) || /deploy/.test(step.run ?? '') || (step.uses ?? '').includes('deploy')) {
+    } else if (/deploy/i.test(step.name) || /deploy/i.test(step.run ?? '') || (step.uses ?? '').includes('deploy')) {
       const image = step.with?.image ?? pushedTag ?? lastBuiltTag;
-      if (!image) { log.push('no image available to deploy'); stage.status = 'failed'; break; }
-      const d = deployImage(world, image as string, 'api', 'ci');
-      log.push(`Deploying ${image} …`);
-      log.push(`Container ${d ? 'replaced' : 'created'} for service api`);
-      log.push('Health check passed after 3.2s');
-      if (world.flags.nextDeployHasBug && !world.flags.badDeployBug) {
-        world.flags.badDeployBug = true;
-        world.flags.nextDeployHasBug = false;
-        log.push('Deployment accepted; watch error rate closely');
+      if (!image) { log.push('no image available to deploy'); stage.status = 'failed'; failRemaining(stepIdx); break; }
+      const strategy = String(step.with?.strategy ?? ctx.strategy ?? 'rolling').toLowerCase();
+      if (strategy === 'canary') {
+        // progressive delivery: 10% fleet first, promote from the observation window
+        startCanary(world, image);
+        log.push(`Canary deploy: ${image} to 10% of traffic`);
+        log.push('Observing for 30 sim minutes — auto-abort on error spike, auto-promote when clean');
+      } else {
+        if (strategy === 'blue-green') {
+          // instant traffic switch, previous release kept warm for rollback
+          world.ci.blueGreen = { activeImage: image, warmImage: world.app.image ?? image };
+          world.flags.blueGreenUsed = true;
+          log.push(`Blue/green switch: green (${image}) live, blue (${world.ci.blueGreen.warmImage}) kept warm`);
+        }
+        const d = deployImage(world, image as string, 'api', 'ci');
+        log.push(`Deploying ${image} …`);
+        log.push(`Container ${d ? 'replaced' : 'created'} for service api`);
+        log.push('Health check passed after 3.2s');
+        if (world.flags.nextDeployHasBug && !world.flags.badDeployBug) {
+          world.flags.badDeployBug = true;
+          world.flags.nextDeployHasBug = false;
+          if ((world.flags.m17BugPending && !world.flags.stagingCaughtBug)
+            || (world.flags.canaryBugPending && !world.flags.canaryAutoAbort)) {
+            // QA's regression re-plants itself in the next release until the pipeline catches it
+            world.flags.nextDeployHasBug = true;
+          }
+          log.push('Deployment accepted; watch error rate closely');
+        }
       }
     } else if (step.run) {
       log.push(`$ ${step.run}`);
@@ -134,18 +260,12 @@ export function runPipeline(world: World, pipelinePath: string): CiRun {
     }
   }
 
-  // mark remaining stages skipped on failure
+  // a failed stage ends the run (remaining steps were appended as skipped)
   if (run.status === 'running' && run.stages.some((s) => s.status === 'failed')) {
-    let seenFailure = false;
-    for (const s of run.stages) {
-      if (s.status === 'failed') seenFailure = true;
-      else if (seenFailure && s.status === 'success') s.status = 'skipped';
-    }
     finish('failed');
   } else if (run.status === 'running') {
     finish('success');
   }
-  return run;
 }
 
 export function deployImage(world: World, image: string, service: string, source: Deployment['source']): Deployment {

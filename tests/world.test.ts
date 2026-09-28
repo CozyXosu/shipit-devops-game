@@ -43,19 +43,19 @@ describe('economy & metrics engine', () => {
 });
 
 describe('persistence', () => {
-  it('save → new storage instance → load roundtrip', () => {
+  it('save → new storage instance → load roundtrip', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'shipit-'));
     const store = new JsonStorage(dir);
     const s = stateOf();
     s.world.company.users = 4321;
-    store.save(s);
+    await store.save(s);
     const store2 = new JsonStorage(dir);
-    const loaded = store2.load('eco');
+    const loaded = await store2.load('eco');
     expect(loaded?.world.company.users).toBe(4321);
     expect(loaded?.world.company.name).toBe('EcoCo');
-    expect(store2.list().length).toBe(1);
-    expect(store2.delete('eco')).toBe(true);
-    expect(store2.load('eco')).toBeNull();
+    expect((await store2.list()).length).toBe(1);
+    expect(await store2.delete('eco')).toBe(true);
+    expect(await store2.load('eco')).toBeNull();
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
@@ -74,13 +74,13 @@ describe('mission engine', () => {
     expect(s.missions.hintsUsed['m01-ssh']).toBe(3);
   });
 
-  it('mission summaries report statuses; 16 missions in the build phase', () => {
+  it('mission summaries report statuses; 32 missions across build + operate + ecosystem + bonus', () => {
     const s = stateOf(createWorld('Acme Metrics', 'you'));
     s.missions.current = 'm01-ssh';
     const sums = allMissionSummaries(s);
     expect(sums.find((m) => m.id === 'm01-ssh')?.status).toBe('active');
     expect(sums.find((m) => m.id === 'm02-dead-api')?.status).toBe('locked');
-    expect(sums.length).toBe(16);
+    expect(sums.length).toBe(32);
   });
 
   it('evaluateMissions is a no-op with no current mission', () => {

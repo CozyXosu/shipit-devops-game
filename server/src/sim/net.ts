@@ -2,6 +2,7 @@
 // simulated world (curl -> DNS table -> host -> nginx config -> app).
 import { World, SimHost } from '../types';
 import { getDir, getFile, listDir } from './fs';
+import { k8sServes } from './k8s';
 
 export interface HttpResult {
   ok: boolean; // request reached something
@@ -21,9 +22,14 @@ export interface NginxSite {
   root?: string;
 }
 
-export function resolveHostname(world: World, hostname: string): { kind: 'session' } | { kind: 'host'; host: SimHost } | { kind: 'lb' } | { kind: 'nxdomain'; error: string } {
+export function resolveHostname(world: World, hostname: string): { kind: 'session' } | { kind: 'host'; host: SimHost } | { kind: 'lb' } | { kind: 'k8s' } | { kind: 'nxdomain'; error: string } {
   if (hostname === 'localhost' || hostname === '127.0.0.1') return { kind: 'session' };
   if (world.lb?.provisioned && (world.lb.ip === hostname)) return { kind: 'lb' };
+  // Kubernetes: service LoadBalancer IP or the cluster's own API endpoint
+  if (world.k8s?.provisioned) {
+    if (Object.values(world.k8s.services).some((s) => s.ingressIp === hostname)) return { kind: 'k8s' };
+    if (world.k8s.ip === hostname) return { kind: 'k8s' };
+  }
   for (const h of Object.values(world.hosts)) {
     if (h.ip === hostname) return { kind: 'host', host: h };
   }
@@ -31,6 +37,7 @@ export function resolveHostname(world: World, hostname: string): { kind: 'sessio
     const rec = world.dns[zone][hostname];
     if (rec && rec.type === 'A') {
       if (world.lb?.provisioned && world.lb.ip === rec.value) return { kind: 'lb' };
+      if (world.k8s?.provisioned && Object.values(world.k8s.services).some((s) => s.ingressIp === rec.value)) return { kind: 'k8s' };
       for (const h of Object.values(world.hosts)) {
         if (h.ip === rec.value) return { kind: 'host', host: h };
       }
@@ -56,6 +63,7 @@ export function hostServesApi(world: World, hostId: string): boolean {
 /**
  * Backends the LB can route to, in order. A backend is usable when its host
  * actually serves the app; `healthy` additionally excludes hosts that are down.
+ * A serving Kubernetes cluster registers as one cloud-managed backend.
  */
 export function lbBackends(world: World): { id: string; healthy: boolean }[] {
   if (!world.lb?.provisioned) return [];
@@ -65,6 +73,7 @@ export function lbBackends(world: World): { id: string; healthy: boolean }[] {
     const down = hostId === 'web-01' && Boolean(world.flags.web01Down);
     out.push({ id: hostId, healthy: !down });
   }
+  if (k8sServes(world)) out.push({ id: 'k8s-01', healthy: true });
   return out;
 }
 
@@ -176,6 +185,16 @@ export function httpRequest(world: World, rawUrl: string, opts: { headOnly?: boo
   const resolved = resolveHostname(world, hostname);
   if (resolved.kind === 'nxdomain') return { ok: false, error: resolved.error, timeMs: 12 };
 
+  // kubernetes: served by ready pods behind a Service/Ingress
+  if (resolved.kind === 'k8s') {
+    if (!k8sServes(world)) {
+      return { ok: false, error: `curl: (7) Failed to connect to ${hostname} port ${port}: Connection refused (no ready pods)`, timeMs: 3 };
+    }
+    const res = appResponse(world, path, world.hosts['web-01']);
+    if (res.ok && res.headers) res.headers = ['Server: envoy', 'X-Served-By: k8s-01', ...res.headers];
+    return res;
+  }
+
   // load balancer: pick a healthy backend (rotate by sim minute), forward there
   if (resolved.kind === 'lb') {
     const backends = lbBackends(world);
@@ -187,6 +206,11 @@ export function httpRequest(world: World, rawUrl: string, opts: { headOnly?: boo
       return { ok: true, status: 503, statusText: 'Service Unavailable', headers: ['Server: lb/2.0'], body: '<html><body><h1>503: all backends down</h1></body></html>', timeMs: 8 };
     }
     const chosen = healthy[world.nowMin % healthy.length];
+    if (chosen.id === 'k8s-01') {
+      const res = appResponse(world, path, world.hosts['web-01']);
+      if (res.ok && res.headers) res.headers = ['Server: lb/2.0', 'X-Backend: k8s-01', ...res.headers];
+      return res;
+    }
     const res = appResponse(world, path, world.hosts[chosen.id]);
     if (res.ok && res.headers) res.headers = ['Server: lb/2.0', 'X-Backend: ' + chosen.id, ...res.headers];
     return res;

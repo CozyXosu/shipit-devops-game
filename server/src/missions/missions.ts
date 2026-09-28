@@ -6,7 +6,7 @@ import { inspectDockerfile } from '../sim/host';
 import { status as gitStatus, isIgnored } from '../sim/git';
 import { parseNginxSites, httpRequest, hostServesApi } from '../sim/net';
 import { analyzeStages, loadPipeline } from '../sim/ci';
-import { diskUsagePct, audit } from '../world';
+import { diskUsagePct, audit, sloReport, ensureCloud, ensureProducts, productMrrOf, baseMrrOf, setFinopsBaseline, monthlyInfraCost } from '../world';
 
 export interface Requirement { id: string; label: string; check: (w: World) => boolean }
 
@@ -14,14 +14,14 @@ export interface MissionDef {
   id: string;
   index: number;
   title: string;
-  phase: 'build' | 'operate';
+  phase: 'build' | 'operate' | 'ecosystem' | 'bonus';
   story: string;
   objective: string;
   coaching: string;
   skills: string[];
   requirements: Requirement[];
   hints: string[];
-  rewards: { cash: number; xp: Record<string, number> };
+  rewards: { cash: number; xp: Record<string, number>; tournamentPoints?: number };
   onStart?: (w: World) => void;
   onComplete?: (w: World) => void;
 }
@@ -56,6 +56,8 @@ function missionApiContainer(w: World): boolean {
 // =====================================================================
 // MISSIONS
 // =====================================================================
+import { k8sServes } from '../sim/k8s';
+
 export const MISSIONS: MissionDef[] = [
   // -------------------------------------------------------- 1
   {
@@ -553,16 +555,500 @@ export const MISSIONS: MissionDef[] = [
       audit(w, 'system', 'game', 'HA mission started — a chaos drill (web-01 kernel panic) is armed for ~90 sim minutes from now.');
     },
     onComplete: (w) => {
+      audit(w, 'system', 'game', 'The platform survives losing a server. Jordan: "now let us ship like grown-ups" — staging, e2e and approvals are next.');
+    }
+  },
+  // -------------------------------------------------------- 17
+  {
+    id: 'm17-e2e',
+    index: 17,
+    title: 'Clicking on purpose',
+    phase: 'build',
+    story: 'Postmortem action from the bad deploy: nothing reaches production again without proof it works. Jordan mandates a staging environment and end-to-end tests — and QA\'s Sam plants a canary regression in the next release to PROVE the pipeline catches it.',
+    objective: 'Extend the pipeline: deploy to STAGING, run E2E against it, then gate the production deploy behind an approval. Ship the release — watch e2e catch the canary — then ship the fixed release through the approval.',
+    coaching: 'Edit .ci/pipeline.yml: add a deploy_staging step, an e2e step (run: npm run e2e), an approval gate (uses: sim/approval) BEFORE the production deploy step. Commit, run the pipeline in the CI tab, and watch what happens.',
+    skills: ['cicd', 'observability'],
+    requirements: [
+      { id: 'staging', label: 'Staging environment deployed (deploy_staging step)', check: (w) => Boolean(w.ci.staging?.image) },
+      { id: 'e2e', label: 'E2E suite ran against staging', check: (w) => (w.ci.staging?.e2eLog.length ?? 0) > 0 },
+      { id: 'caught', label: 'The canary regression was caught in staging (production untouched)', check: (w) => {
+        if (!w.flags.stagingCaughtBug) return false;
+        const started = Number(w.flags.m17StartedAtMin ?? 0);
+        return !w.monitoring.incidents.some((i) => i.kind === 'bad_deploy' && i.openedAtMin > started);
+      } },
+      { id: 'approved', label: 'A production deploy passed the approval gate', check: (w) => Boolean(w.flags.ciApprovalUsed) },
+      { id: 'prod-fixed', label: 'The fixed release was deployed to production after the catch', check: (w) => {
+        const active = w.ci.deployments.find((d) => d.active);
+        return Boolean(active && active.id !== w.flags.stagingCaughtDeployId && active.createdAtMin >= Number(w.flags.stagingCaughtAtMin ?? Infinity));
+      } }
+    ],
+    hints: [
+      'Pipeline order matters: build → push → deploy_staging → e2e → approval → deploy. Commit the file first. Staging deploy step: `- name: deploy_staging\n    uses: sim/deploy-staging`',
+      'Continue with:\n  - name: e2e\n    run: npm run e2e\n  - name: approve\n    uses: sim/approval\n  - name: deploy\n    uses: sim/deploy\nThe e2e step runs Playwright against staging. The run PAUSES at the approval — approve it in the CI tab.',
+      'Run the pipeline: e2e FAILS (the canary!) and production is never touched. Teammate ships the fix — just RUN PIPELINE again: e2e passes, the run waits for your APPROVAL, and the fixed release deploys.'
+    ],
+    rewards: { cash: 5000, xp: { cicd: 60, observability: 20 } },
+    onStart: (w) => {
+      w.flags.nextDeployHasBug = true;
+      w.flags.m17BugPending = true;
+      w.flags.m17StartedAtMin = w.nowMin;
+      audit(w, 'sam (qa)', 'game', 'Canary armed: the next release ships with a planted regression. If your pipeline is any good, users will never see it.');
+    },
+    onComplete: (w) => {
+      w.flags.m17BugPending = false;
+      w.flags.nextDeployHasBug = false;
+      audit(w, 'system', 'game', 'The pipeline is trusted: staging catches what humans miss, approvals gate production. Maya the senior infra engineer starts Monday.');
+    }
+  },
+  // -------------------------------------------------------- 18
+  {
+    id: 'm18-terraform',
+    index: 18,
+    title: 'Under new management',
+    phase: 'build',
+    story: 'Maya arrives and finds a console-built platform: two VMs, a load balancer and a database, all clicked into existence. "If it isn\'t code, it doesn\'t exist." Time to bring the infrastructure under Terraform management.',
+    objective: 'Install terraform, describe the CURRENT infrastructure in /opt/infra/main.tf, initialize, and import every existing resource until the plan is clean. Then catch the console drift Maya predicts — and reconcile it with terraform apply.',
+    coaching: 'sudo apt-get install -y terraform. mkdir -p /opt/infra; write main.tf in the EDITOR (stratus_vm web-01 + vm-02, stratus_lb lb01, stratus_db main). cd /opt/infra && terraform init, then terraform plan lists what needs importing — import each: terraform import stratus_vm.web-01 i-web01 (any id works).',
+    skills: ['cloud', 'architecture'],
+    requirements: [
+      { id: 'installed', label: 'terraform installed', check: (w) => w.hosts['web-01'].packages.includes('terraform') },
+      { id: 'init', label: 'Working directory initialized (terraform init)', check: (w) => Boolean(w.tf?.initialized) },
+      { id: 'managed', label: 'All infra imported: both VMs, the LB, the database', check: (w) => {
+        const r = w.tf?.resources ?? {};
+        return Boolean(r['stratus_vm.web-01'] && r['stratus_vm.vm-02'] && (!w.lb?.provisioned || r['stratus_lb.lb01']) && (!w.db.provisioned || r['stratus_db.main']));
+      } },
+      { id: 'clean', label: 'terraform plan reports "No changes"', check: (w) => Boolean(w.tf?.lastPlanClean && w.tf.initialized) },
+      { id: 'drift', label: 'Console drift detected with terraform plan', check: (w) => Boolean(w.tf?.driftDetected) },
+      { id: 'reconciled', label: 'Drift reconciled with terraform apply (db back to db.small)', check: (w) => Boolean(w.tf?.driftResolved) && w.db.plan === 'db.small' }
+    ],
+    hints: [
+      'main.tf describes what SHOULD exist:\nprovider "stratus" { region = "us-east-1" }\nresource "stratus_vm" "web-01" { size = "m3.medium" }\nresource "stratus_vm" "vm-02" { size = "m3.medium" }\nresource "stratus_lb" "lb01" { }\nresource "stratus_db" "main" { plan = "db.small" }',
+      'cd /opt/infra && terraform init. terraform plan says "+ … will be created" for things that already exist — real Terraform would collide. Import them instead: terraform import stratus_vm.web-01 i-123 (repeat for vm-02, stratus_lb.lb01, stratus_db.main). Then plan again: "No changes".',
+      'Maya\'s prediction: watch the audit feed — someone will "save money" via the console. When it happens: terraform plan shows the drift in red; terraform apply -auto-approve forces the cloud back to the code.'
+    ],
+    rewards: { cash: 5000, xp: { cloud: 50, architecture: 30 } },
+    onStart: (w) => {
+      w.scheduledEvents.push({ atMin: w.nowMin + 45, kind: 'tf_drift' });
+      audit(w, 'maya', 'game', 'Maya: "Mark my words — within the hour, someone will click the console instead of changing the code."');
+    },
+    onComplete: (w) => {
+      audit(w, 'system', 'game', 'Infrastructure-as-code: the console is now read-only by convention, and drift has a detection loop.');
+    }
+  },
+  // -------------------------------------------------------- 19
+  {
+    id: 'm19-k8s',
+    index: 19,
+    title: 'Pods of plenty',
+    phase: 'build',
+    story: 'Traffic keeps climbing and per-VM "docker run" deploys do not scale — you deploy to two boxes by hand. Maya runs a Kubernetes workshop and the board approves a managed cluster. Deploys become rollouts; the platform becomes self-healing.',
+    objective: 'Provision the k8s cluster (CLOUD tab), write real manifests (Deployment with 2 replicas + readiness/liveness probes, Service type LoadBalancer, Ingress), apply them, route traffic through the cluster, prove a zero-downtime rolling update, and let an HPA handle the load.',
+    coaching: 'CLOUD → Kubernetes → Provision. Write /opt/app/k8s/deployment.yaml + service.yaml + ingress.yaml in the EDITOR (a Service of type LoadBalancer gets an external IP and registers behind lb-01). Then: kubectl apply -f k8s/, kubectl get pods. Rolling update: kubectl set image deployment/api api=registry.acme.dev/acme/api:v2. HPA: kubectl autoscale deployment/api --min=2 --max=6 --cpu-percent=70.',
+    skills: ['architecture', 'docker'],
+    requirements: [
+      { id: 'cluster', label: 'Kubernetes cluster provisioned', check: (w) => Boolean(w.k8s?.provisioned) },
+      { id: 'deployment', label: 'api Deployment: ≥2 replicas with readiness AND liveness probes', check: (w) => {
+        const d = w.k8s?.deployments['api'];
+        return Boolean(d && d.replicas >= 2 && d.readinessProbe && d.livenessProbe);
+      } },
+      { id: 'exposed', label: 'Service (LoadBalancer) + Ingress expose the Deployment', check: (w) => {
+        const k = w.k8s;
+        return Boolean(k && Object.values(k.services).some((s) => s.type === 'LoadBalancer' && s.selector === 'api') && Object.keys(k.ingresses).length > 0);
+      } },
+      { id: 'serving', label: 'The cluster serves production traffic (behind lb-01)', check: (w) => k8sServes(w) },
+      { id: 'rollout', label: 'Zero-downtime rolling update (revision ≥ 2, RollingUpdate)', check: (w) => {
+        const d = w.k8s?.deployments['api'];
+        return Boolean(d && d.revision >= 2 && d.strategy === 'RollingUpdate' && w.k8s?.zeroDowntimeProven);
+      } },
+      { id: 'hpa', label: 'HPA configured and it scaled out under load', check: (w) => {
+        const k = w.k8s;
+        return Boolean(k && Object.values(k.hpas).some((h) => h.deployment === 'api' && h.peakedAtMin !== undefined));
+      } }
+    ],
+    hints: [
+      'CLOUD tab → Kubernetes → PROVISION CLUSTER. Then EDITOR → /opt/app/k8s/deployment.yaml:\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  replicas: 2\n  selector:\n    matchLabels:\n      app: api\n  template:\n    metadata:\n      labels:\n        app: api\n    spec:\n      containers:\n        - name: api\n          image: registry.acme.dev/acme/api:v1\n          ports:\n            - containerPort: 8080\n          readinessProbe:\n            httpGet: { path: /health, port: 8080 }\n          livenessProbe:\n            httpGet: { path: /health, port: 8080 }',
+      'k8s/service.yaml:\napiVersion: v1\nkind: Service\nmetadata:\n  name: api\nspec:\n  type: LoadBalancer\n  selector:\n    app: api\n  ports:\n    - port: 80\n      targetPort: 8080\nAnd k8s/ingress.yaml:\napiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: api\nspec:\n  rules:\n    - host: api.{domain}\n      http:\n        paths:\n          - path: /\n            pathType: Prefix\n            backend:\n              service:\n                name: api\n                port: 80\nThen (SSH on web-01, in /opt/app): kubectl apply -f k8s/ — watch pods go Pending → Running → Ready.',
+      'Rolling update: kubectl set image deployment/api api=registry.acme.dev/acme/api:v2 then kubectl rollout status deployment/api — old pods retire only when new ones are Ready (zero downtime). Autoscale: kubectl autoscale deployment/api --min=2 --max=6 --cpu-percent=70 — with current traffic it scales out within minutes.'
+    ],
+    rewards: { cash: 7000, xp: { architecture: 60, docker: 30 } },
+    onStart: (w) => {
+      w.scheduledEvents.push({ atMin: w.nowMin + 60, kind: 'traffic_spike' });
+      audit(w, 'system', 'game', 'Kubernetes mission started — a traffic spike is coming in ~60 sim minutes. HPA had better be ready.');
+    },
+    onComplete: (w) => {
+      audit(w, 'system', 'game', 'The platform runs itself: rollouts, probes, autoscaling. One existential risk left — the data.');
+    }
+  },
+  // -------------------------------------------------------- 20
+  {
+    id: 'm20-dr',
+    index: 20,
+    title: 'Out of region, out of mind',
+    phase: 'build',
+    story: 'The board\'s final question: "What happens when the database dies?" There are no backups. Nothing. Nada. And a teammate is about to ship a "cleanup" migration with a DROP TABLE in it.',
+    objective: 'Enable automated daily backups on the managed database BEFORE disaster strikes. When the data-loss incident fires: restore from your own backup, verify the data, meet RPO ≤ 24h, and file the postmortem.',
+    coaching: 'CLOUD → Databases → Backups → ENABLE (daily, 7-day retention; the first snapshot runs immediately). When the incident fires: CLOUD → Databases → RESTORE FROM BACKUP, verify orders rows in the DATABASE tab, then INCIDENTS → postmortem.',
+    skills: ['databases', 'observability'],
+    requirements: [
+      { id: 'backups', label: 'Automated backups enabled with ≥1 snapshot', check: (w) => Boolean(w.db.backups.enabled && w.db.backups.snapshots.length > 0) },
+      { id: 'before', label: 'Backups were enabled BEFORE the incident', check: (w) => {
+        const inc = w.monitoring.incidents.find((i) => i.id === w.flags.drRestoreIncident);
+        const enabledAt = w.db.backups.enabledAtMin;
+        return Boolean(inc && enabledAt !== undefined && enabledAt < inc.openedAtMin);
+      } },
+      { id: 'incident', label: 'The data-loss incident fired', check: (w) => w.monitoring.incidents.some((i) => i.kind === 'data_loss') },
+      { id: 'restored', label: 'Database restored from YOUR backup (orders rows back)', check: (w) => Boolean(w.flags.drRestoreDone) && (w.db.tables['orders']?.rowCount ?? 0) >= 900000 },
+      { id: 'rpo', label: 'RPO ≤ 24h and the restore drill completed', check: (w) => {
+        const rpo = w.flags.drRpoMin;
+        return typeof rpo === 'number' && rpo <= 1440 && Boolean(w.flags.drRestoreDone);
+      } },
+      { id: 'postmortem', label: 'Postmortem filed with ≥3 corrective actions', check: (w) => {
+        const inc = w.monitoring.incidents.find((i) => i.id === w.flags.drRestoreIncident);
+        return Boolean(inc?.postmortemFiled && inc.corrective.filter((c) => c.done).length >= 3);
+      } }
+    ],
+    hints: [
+      'CLOUD tab → Managed databases → Backups: ENABLE. The first snapshot runs immediately — that is your restore point. Do this BEFORE the incident (a backup created after the loss restores nothing).',
+      'When the migration hits: orders go to 0, error rate spikes, a SEV1 data-loss incident opens. CLOUD → Databases → RESTORE FROM BACKUP (point-in-time: it uses the latest snapshot from before the incident).',
+      'Verify in the DATABASE tab (\\dt or SELECT) that orders rows are back over 1M. Then MONITORING → INCIDENTS → postmortem: tick at least restore/backups/pitr corrective actions. RPO (how much data you lost) must be ≤ 24h — daily snapshots guarantee it.'
+    ],
+    rewards: { cash: 8000, xp: { databases: 50, architecture: 30 } },
+    onStart: (w) => {
+      w.scheduledEvents.push({ atMin: w.nowMin + 90, kind: 'dr_drill' });
+      audit(w, 'system', 'game', 'A teammate is preparing a "cleanup" migration. It ships in ~90 sim minutes. Backups first, engineer. Backups first.');
+    },
+    onComplete: (w) => {
       w.flags.buildPhaseComplete = true;
-      audit(w, 'system', 'game', 'BUILD PHASE COMPLETE (v0.2) — 16 missions, a real platform, and proof it survives losing a server. OPERATE phase continues.');
+      audit(w, 'system', 'game', 'BUILD PHASE COMPLETE — 20 missions: from a dead API on one box to a self-healing, backed-up, code-managed platform. OPERATE phase: the world keeps happening.');
+    }
+  },
+  // -------------------------------------------------------- 21
+  {
+    id: 'm21-team',
+    index: 21,
+    title: 'The platform team',
+    phase: 'operate',
+    story: 'Revenue is real now, and you are still a team of one. The pager goes to Jordan when you sleep. It is time to hire — and to build the rotation so the company survives your nights off.',
+    objective: 'Open the COMPANY tab: hire at least two engineers, put one on call, and live through an incident that pages them (one is coming — the world does not wait).',
+    coaching: 'COMPANY tab → Team: each role has a salary and an effect (seniors calm incident probability, SREs halve customer impact and answer the pager). Then set ON-CALL. An ambient incident is armed ~90 sim minutes from now.',
+    skills: ['architecture'],
+    requirements: [
+      { id: 'hired', label: 'At least two engineers hired', check: (w) => (w.team?.engineers.length ?? 0) >= 2 },
+      { id: 'oncall', label: 'Someone is on call', check: (w) => Boolean(w.team?.onCallId) },
+      { id: 'paged', label: 'An incident paged the on-call engineer', check: (w) => Boolean(w.flags.onCallPaged) },
+      { id: 'handled', label: 'A paged incident was resolved', check: (w) => w.monitoring.incidents.some((i) => i.status === 'resolved' && i.timeline.some((ev) => ev.text.includes('paged'))) }
+    ],
+    hints: [
+      'COMPANY tab → Team → HIRE. A senior calms the platform; an SRE is the on-call hero. Two salaries, two calm nights.',
+      'COMPANY tab → On-call: pick an engineer (SRE acknowledges in 40s flat). Without on-call, the pager goes to the founder.',
+      'Wait for the ambient incident (~90 sim min from mission start — 16× helps). It resolves itself when the surge ends; your on-call engineer just has to answer the page.'
+    ],
+    rewards: { cash: 5000, xp: { architecture: 40 } },
+    onStart: (w) => {
+      w.scheduledEvents.push({ atMin: w.nowMin + 90, kind: 'ambient_incident' });
+      audit(w, 'system', 'game', 'OPERATE phase: hiring open. A traffic incident is armed for ~90 sim minutes — best have someone on call.');
+    },
+    onComplete: (w) => audit(w, 'system', 'game', 'The team is real. The pager no longer goes to the founder.')
+  },
+  // -------------------------------------------------------- 22
+  {
+    id: 'm22-debt',
+    index: 22,
+    title: 'Paying down the mortgage',
+    phase: 'operate',
+    story: 'Maya prints the "technical debt ledger": every incident you lived through, the legacy server nobody deleted, the shortcuts that shipped. Debt raises the odds of the NEXT incident. Time to pay some of it back on purpose.',
+    objective: 'COMPANY tab → Technical debt: run at least two refactoring projects (delete the legacy server!) and bring the debt below 10 points. Your engineers pay it down slowly — projects pay it down fast.',
+    coaching: 'COMPANY tab → Technical debt shows the ledger (how the debt was earned) and the project catalog. START a project: it costs cash and sim time, then removes debt points on completion.',
+    skills: ['architecture', 'cicd'],
+    requirements: [
+      { id: 'ledger', label: 'The debt ledger is open (see what you owe)', check: (w) => w.debt !== undefined },
+      { id: 'projects', label: 'Two refactoring projects completed', check: (w) => (w.debt?.projects.filter((p) => p.done).length ?? 0) >= 2 },
+      { id: 'legacy-gone', label: 'legacy-server.js deleted for good', check: (w) => !fs.getFile(w.hosts['web-01'].fs, '/opt/app/legacy-server.js') },
+      { id: 'low', label: 'Debt below 10 points', check: (w) => (w.debt?.points ?? 99) < 10 }
+    ],
+    hints: [
+      'COMPANY tab → Technical debt → START "Delete the legacy server" ($500, ~2h). It removes the file AND its process for -8 debt.',
+      'Start a second project (runbooks or the database audit). Projects complete on their own as sim time passes — 16× speed helps.',
+      'Your hires pay down ~0.5-1 debt/day passively. Between two finished projects and the team, the ledger drops below 10.'
+    ],
+    rewards: { cash: 5000, xp: { architecture: 40, cicd: 20 } },
+    onStart: (w) => audit(w, 'maya', 'game', 'Maya: "Every shortcut you took is on this ledger. Debt is incident probability. Pay it down on purpose or it will collect itself."'),
+    onComplete: (w) => audit(w, 'system', 'game', 'The ledger is under control. Ambient incident odds drop with it.')
+  },
+  // -------------------------------------------------------- 23
+  {
+    id: 'm23-canary',
+    index: 23,
+    title: 'Canary in the coal mine',
+    phase: 'operate',
+    story: 'Staging caught the last regression — but QA\'s new one only fails under REAL traffic (a leak e2e cannot see). Shipping it to 100% of users at once would be a very short experiment. Progressive delivery: send 10% first, watch, then decide.',
+    objective: 'Switch the pipeline\'s deploy step to strategy: canary. Ship the release: the canary must auto-abort on the error spike (prod untouched). Then re-run the fixed release and let a clean canary promote.',
+    coaching: 'EDIT .ci/pipeline.yml — on the deploy step add:\n    uses: sim/deploy\n    with:\n      strategy: canary\n(or a top-level "strategy: canary"). Run the pipeline: 10% canary, 30 sim minutes of observation, auto-abort on error spike, auto-promote when clean. The CI tab shows the live canary.',
+    skills: ['cicd'],
+    requirements: [
+      { id: 'configured', label: 'Pipeline deploys with the canary strategy', check: (w) => Boolean(w.flags.canaryConfigured) },
+      { id: 'aborted', label: 'Canary auto-aborted the bad release (production untouched)', check: (w) => {
+        if (!w.flags.canaryAutoAbort) return false;
+        const started = Number(w.flags.m23StartedAtMin ?? 0);
+        return !w.monitoring.incidents.some((i) => i.kind === 'bad_deploy' && i.openedAtMin > started);
+      } },
+      { id: 'promoted', label: 'A clean canary was promoted to 100%', check: (w) => Boolean(w.flags.canaryPromoted) }
+    ],
+    hints: [
+      'EDIT .ci/pipeline.yml: under the deploy step add two lines:\n      with:\n        strategy: canary\nCommit and run the pipeline in the CI tab.',
+      'The canary shows errors after ~5 sim minutes and ABORTS itself around minute 8 — production never sees the bug. Watch the CI tab (or audit feed).',
+      'QA ships the fix: RUN PIPELINE again. This canary stays clean; after 30 sim minutes it promotes itself to 100% (you can also PROMOTE NOW from the CI tab).'
+    ],
+    rewards: { cash: 6000, xp: { cicd: 50 } },
+    onStart: (w) => {
+      w.flags.canaryRuntimeBug = true;
+      w.flags.m23StartedAtMin = w.nowMin;
+      audit(w, 'sam (qa)', 'game', 'Canary canary armed: the next release leaks memory under real traffic — staging e2e CANNOT see it. 10% of users will. Ship it carefully.');
+    },
+    onComplete: (w) => audit(w, 'system', 'game', 'Progressive delivery: bad releases now cost 10% of traffic for 8 minutes instead of 100% for hours.')
+  },
+  // -------------------------------------------------------- 24
+  {
+    id: 'm24-slo',
+    index: 24,
+    title: 'Promises you can keep',
+    phase: 'operate',
+    story: 'The enterprise customer\'s contract renewal asks one question: "what do you promise?" Not what you hope — what you COMMIT to, in writing, with consequences. Time to define SLOs and live inside an error budget.',
+    objective: 'MONITORING tab → SLOs: commit to an availability target and a p95 latency target you can actually keep. Then hold them for one full sim day without exhausting the error budget.',
+    coaching: 'MONITORING → SLOs: pick targets (99.0/99.5/99.9 availability; 600/1000ms p95). Ambitious targets = tiny error budgets. Commit, then ship nothing scary and let the budget breathe for a sim day (1440 min).',
+    skills: ['observability'],
+    requirements: [
+      { id: 'committed', label: 'SLOs committed (availability + p95 targets)', check: (w) => Boolean(w.slos?.configured) },
+      { id: 'availability', label: 'Availability SLO currently met', check: (w) => sloReport(w).availabilityMet },
+      { id: 'p95', label: 'p95 latency SLO currently met', check: (w) => sloReport(w).p95Met },
+      { id: 'budget', label: 'Error budget not exhausted', check: (w) => sloReport(w).budgetRemainingPct > 0 },
+      { id: 'held', label: 'SLOs held for one full sim day since committing', check: (w) => {
+        const s = w.slos;
+        if (!s?.setAtMin) return false;
+        return w.nowMin - s.setAtMin >= 1440 && sloReport(w).availabilityMet && sloReport(w).budgetRemainingPct > 0;
+      } }
+    ],
+    hints: [
+      'MONITORING tab → SLOs panel. Look at the error-budget math BEFORE you commit: 99.9% allows only ~43 bad minutes a month. Your history decides what is honest.',
+      '99.5% availability + 1000ms p95 is a defensible first commitment for a company your size. Commit and watch the budget bar.',
+      'Now protect it: no risky deploys, keep the canary strategy, let the traffic settle. One sim day at 4× speed ≈ 6 real minutes.'
+    ],
+    rewards: { cash: 8000, xp: { observability: 50, architecture: 30 } },
+    onStart: (w) => audit(w, 'system', 'game', 'Contract renewal in one sim day. What you promise on paper, you must keep in production.'),
+    onComplete: (w) => {
+      w.flags.operatePhaseComplete = true;
+      audit(w, 'system', 'game', 'P2 MILESTONE COMPLETE — 24 missions: a platform, a team, a budget and promises you can keep. The operate economy continues (P3: multi-cloud, challenge mode).');
+    }
+  },
+  // -------------------------------------------------------- 25
+  {
+    id: 'm25-clouds',
+    index: 25,
+    title: 'Between two clouds',
+    phase: 'ecosystem',
+    story: 'Three sales decks land on your desk the same week. Stratus — the incumbent, list price, a rep who golfs. Volt — 28% cheaper, 99.5% SLA, strong opinions. Orbit — 99.99% and invoice stickers on everything. Maya: "You have been on Stratus by default since day one. Default is not a strategy."',
+    objective: 'CLOUD tab → Providers: run the cost comparison across every provider region. Then survive what your provider is about to do (~4 sim hours): a region-wide outage you cannot fix. Claim the SLA credit and file the postmortem.',
+    coaching: 'CLOUD → Providers shows the tradeoff triangle: price vs reliability vs latency, priced for YOUR stack. The armed outage will take everything down — that is what provider risk costs. When it ends: REQUEST SLA CREDIT, then postmortem like any other incident.',
+    skills: ['cloud'],
+    requirements: [
+      { id: 'compared', label: 'Provider comparison run (price × reliability × latency)', check: (w) => Boolean(w.cloud?.compared) },
+      { id: 'outage', label: 'Survived a provider outage (they cannot be fixed, only priced)', check: (w) => (w.cloud?.outagesSeen ?? 0) >= 1 },
+      { id: 'credit', label: 'SLA credit claimed from the provider', check: (w) => (w.cloud?.creditsTotal ?? 0) > 0 },
+      { id: 'postmortem', label: 'Postmortem filed for the outage', check: (w) => w.monitoring.incidents.some((i) => i.kind === 'provider_outage' && i.postmortemFiled) }
+    ],
+    hints: [
+      'CLOUD tab → Providers → RUN COMPARISON. Read the tradeoffs before touching anything: Volt is 28% cheaper with a 99.5% SLA; Orbit is 99.99% at +30%; regions trade a few % of price for latency.',
+      'The outage pins errors at 80% for 15–45 sim minutes and NOTHING you own is broken — check the provider status (the incident tells you), let it ride, watch the uptime dent.',
+      'After recovery: CLOUD → Providers → REQUEST SLA CREDIT (providers pay for their own outages — if you ask within a sim day). Then MONITORING → INCIDENTS → postmortem: tick the credit, status-page and migration actions.'
+    ],
+    rewards: { cash: 6000, xp: { cloud: 40 } },
+    onStart: (w) => {
+      ensureCloud(w);
+      w.scheduledEvents.push({ atMin: w.nowMin + 240, kind: 'provider_outage' });
+      audit(w, 'maya', 'game', 'Maya: "Three providers, one spreadsheet. Price, reliability, latency — pick your poison on purpose. Oh, and Stratus us-east-1 has been... flaky lately."');
+    },
+    onComplete: (w) => audit(w, 'system', 'game', 'The provider market is now a lever, not a landlord. (And the pager knows the difference between your bugs and their outages.)')
+  },
+  // -------------------------------------------------------- 26
+  {
+    id: 'm26-migrate',
+    index: 26,
+    title: 'Moving day',
+    phase: 'ecosystem',
+    story: 'The board saw the comparison table. Their entire note, verbatim: "why are we paying Stratus rates?" So: migration. The whole stack, to a cheaper footprint, without burning the users you spent 26 missions earning.',
+    objective: 'CLOUD → Providers: pick Volt us-central-1 (the cheap row) and START MIGRATION. Your preparations — backups, staging, load balancer — decide the cutover downtime. Land it at ≤15 minutes with a bill that actually dropped.',
+    coaching: 'The migration panel shows your planned cutover downtime BEFORE you commit: every preparation from earlier missions (backups −10, staging −10, LB −10, k8s −5) shortens it. Six sim hours of prep run themselves; the cutover is the loud part.',
+    skills: ['cloud', 'architecture'],
+    requirements: [
+      { id: 'migrated', label: 'A migration completed end-to-end', check: (w) => (w.cloud?.migrations.length ?? 0) >= 1 },
+      { id: 'rehearsed', label: 'Cutover downtime ≤ 15 minutes (preparations pay off)', check: (w) => (w.cloud?.migrations[0]?.downtimeMin ?? 99) <= 15 },
+      { id: 'cheaper', label: 'The monthly bill dropped vs before the migration', check: (w) => {
+        const m = w.cloud?.migrations[0];
+        return Boolean(m && m.costAfter < m.costBefore);
+      } }
+    ],
+    hints: [
+      'Backups + staging + LB (all from earlier missions) cut the cutover from 45 to 15 minutes; the Kubernetes cluster shaves 5 more. The panel computes it live — missing one is the difference between a blip and an outage.',
+      'Pick the Volt us-central-1 row → START MIGRATION (~15% of the monthly bill, one time). Prep and replication narrate themselves in the audit feed; the cutover pins errors for the planned minutes.',
+      'After the cutover the whole footprint prices at Volt rates (COSTS tab, every line item tagged volt/us-central-1). Reliability is now 99.5% — outages are ~3.6× likelier. Cheaper is a choice with consequences.'
+    ],
+    rewards: { cash: 6000, xp: { cloud: 50, architecture: 20 } },
+    onStart: (w) => audit(w, 'system', 'game', 'The board wants the bill down and the users asleep. Moving day is coming — bring backups, a rehearsal, and a load balancer.'),
+    onComplete: (w) => audit(w, 'system', 'game', 'Migration complete with a rehearsed cutover. This is what "cattle, not pets" buys you: the whole zoo moved and the users noticed for minutes.')
+  },
+  // -------------------------------------------------------- 27
+  {
+    id: 'm27-products',
+    index: 27,
+    title: 'The second product',
+    phase: 'ecosystem',
+    story: 'Jordan walks in with a napkin: "One product is a job. Two products is a company." The platform you built can carry more than one product — and the second one is where margins live.',
+    objective: 'COMPANY tab → Products: build and launch two products, including Enterprise Grid (it has gates: written SLOs, happy users, a real team). Get product revenue to 10% of the subscription MRR.',
+    coaching: 'Products build themselves over sim hours (they cost cash up front), then bill their share of users monthly. Enterprise Grid refuses to start until the company can honestly support it — SLOs on paper, satisfaction ≥ 4, two engineers.',
+    skills: ['architecture'],
+    requirements: [
+      { id: 'shipped', label: 'Two products launched', check: (w) => ensureProducts(w).products.filter((p) => p.launchedAtMin !== undefined).length >= 2 },
+      { id: 'enterprise', label: 'Enterprise Grid launched (the gated tier)', check: (w) => ensureProducts(w).products.some((p) => p.id === 'ent-grid' && p.launchedAtMin !== undefined) },
+      { id: 'revenue', label: 'Product MRR ≥ 10% of subscription MRR', check: (w) => productMrrOf(w) >= 0.1 * baseMrrOf(w) }
+    ],
+    hints: [
+      'COMPANY → Products: Insights ($800, ~4h) and ShipLink ($1,600, ~6h) build on their own while time passes — launches add a satisfaction bump, monthly revenue and a little infra cost.',
+      'Enterprise Grid is gated on purpose: it needs WRITTEN SLOs (mission 24), satisfaction ≥ 4 and at least two engineers. Enterprise money comes with enterprise promises.',
+      'The revenue bar is relative (10% of subscriptions): Insights + Enterprise Grid usually clear it by themselves; ShipLink makes it comfortable. Watch MRR build as users keep growing.'
+    ],
+    rewards: { cash: 6000, xp: { architecture: 40 } },
+    onStart: (w) => audit(w, 'jordan (founder)', 'game', 'Jordan: "The platform can carry more than one product. Ship the second one — and sell the big one to people who read SLAs."'),
+    onComplete: (w) => audit(w, 'system', 'game', 'A portfolio, not a product. Every launch bills monthly and the platform barely noticed — that is leverage.')
+  },
+  // -------------------------------------------------------- 28
+  {
+    id: 'm28-finops',
+    index: 28,
+    title: 'Where the money goes',
+    phase: 'ecosystem',
+    story: 'Maya slides exactly one slide across the table: the cloud bill as a share of revenue, trending the wrong way. "FinOps," she says, like it\'s a personality trait. "Every dollar should have a job. Go find the dollars sleeping on the job."',
+    objective: 'COSTS tab → FinOps: set a monthly budget, resolve at least three rightsizing recommendations (the table says exactly what to do), cut the bill 15% below today\'s baseline, then hold the budget for two sim days.',
+    coaching: 'The FinOps panel computes recommendations from LIVE utilization — an oversized database, a relic VM, an idle node, uncommitted compute. Each ACT button does the thing. The baseline is captured the moment this mission starts; the daily scoreboard counts days under budget.',
+    skills: ['cloud', 'finops'],
+    requirements: [
+      { id: 'budget', label: 'A monthly infra budget is set', check: (w) => Boolean(w.finops?.budgetMonthly) },
+      { id: 'recs', label: 'Three FinOps recommendations resolved', check: (w) => (w.finops?.resolved.length ?? 0) >= 3 },
+      { id: 'cheaper', label: 'Bill at least 15% below the FinOps baseline', check: (w) => {
+        const f = w.finops;
+        return Boolean(f?.baselineMonthly && monthlyInfraCost(w) <= 0.85 * f.baselineMonthly);
+      } },
+      { id: 'discipline', label: 'Two sim days held under budget', check: (w) => (w.finops?.daysUnderBudget ?? 0) >= 2 }
+    ],
+    hints: [
+      'COSTS → FinOps → SET BUDGET at what the OPTIMIZED bill should be, not what you hope for. The scoreboard counts sim days under/over — set it after the cuts, not before.',
+      'The recommendations are a to-do list: decommission vm-02 (Kubernetes serves now), scale the node pool 3→2 (scale the api deployment to ≤2 replicas first — the rec appears when nothing needs 3 nodes), commit 1-year reserved compute (20% off, but only while you stay put).',
+      'Three cuts ≈ −30% against the baseline. Then keep it under budget for two sim days — 16× speed makes it a coffee break. Migration to Volt counts too, but you already did that the smart way.'
+    ],
+    rewards: { cash: 10000, xp: { finops: 50, cloud: 20 } },
+    onStart: (w) => {
+      setFinopsBaseline(w);
+      audit(w, 'maya', 'game', 'Maya: "Baseline captured. Every dollar now has a job description. I\'ll check back when the scoreboard says you mean it."');
+    },
+    onComplete: (w) => {
+      w.flags.ecosystemPhaseComplete = true;
+      audit(w, 'system', 'game', 'P3 MILESTONE COMPLETE — 28 missions: a platform, a team, promises, a portfolio, and a bill with a job. P4 unlocked: mission packs, the postmortem tournament, challenge mode (MODES tab).');
+    }
+  },
+  // -------------------------------------------------------- 29
+  {
+    id: 'm29-packs',
+    index: 29,
+    title: 'The content engine',
+    phase: 'bonus',
+    story: 'Maya drops a one-page spec on your desk: "MISSION PACKS v1". The training program, refactored into JSON bundles — installable, swappable, writable by anyone. Screw it on right and content ships like software. First pack off the shelf: THE POSTMORTEM TOURNAMENT. Five rounds. Live incidents. A scoreboard with rivals on it.',
+    objective: 'MODES tab → Mission packs: read the format note, activate The Postmortem Tournament, and win Round 1 (a traffic surge is coming — resolve it, postmortem it, stay under 150 minutes MTTR).',
+    coaching: 'MODES → MISSION PACKS → ACTIVATE. The pack runs as a bonus track next to the career chain (the dock shows both). Rounds inject real incidents — the scoreboard and rivals update live in MODES.',
+    skills: ['observability'],
+    requirements: [
+      { id: 'activated', label: 'A mission pack activated', check: (w) => Boolean(w.flags.packActivated) },
+      { id: 'joined', label: 'Tournament joined (rivals on the board)', check: (w) => w.tournament !== undefined },
+      { id: 'round1', label: 'Round 1 won (surge resolved + postmortem + MTTR)', check: (w) => Number(w.flags.packMissionsDone ?? 0) >= 1 }
+    ],
+    hints: [
+      'MODES tab → MISSION PACKS panel → ACTIVATE on "The Postmortem Tournament". It opens after mission 28 — which you just finished.',
+      'Round 1 injects a traffic surge ~10 sim minutes in. It self-resolves; your score is the postmortem (≥2 corrective actions) and MTTR ≤ 150.',
+      'Watch the MODES tab scoreboard — Cloud Nine, Null Pointers and Ping Payments are playing the same gauntlet, and they do not take coffee breaks.'
+    ],
+    rewards: { cash: 4000, xp: { observability: 30 } },
+    onStart: (w) => audit(w, 'maya', 'game', 'Maya: "Content as software. Activate the tournament pack — and pretend the rivals are watching, because the scoreboard says they are."'),
+    onComplete: (w) => audit(w, 'system', 'game', 'The pack format is real: JSON in, missions out. Round 1 down.')
+  },
+  // -------------------------------------------------------- 30
+  {
+    id: 'm30-tournament',
+    index: 30,
+    title: 'The postmortem tournament',
+    phase: 'bonus',
+    story: 'The bracket narrows. Round of eight: someone ships a broken release while you watch. Semifinal: a region-wide provider outage — same outage for every team, "a level playing field". Final four: they drop your orders table on purpose. The trophy goes to whoever recovers, documents, and gets billed correctly.',
+    objective: 'Win the tournament: all five rounds, tournament points ≥ 38, and first place on the scoreboard when the trophy round clears.',
+    coaching: 'Each round is faster than the last (MTTR 150 → 90). Rollbacks are one click in CI. Provider credits are one click in CLOUD after the outage ends. The restore is one click in CLOUD → Databases — IF backups were on before the drop.',
+    skills: ['observability', 'cicd', 'databases'],
+    requirements: [
+      { id: 'rounds', label: 'All five rounds won', check: (w) => Number(w.flags.packMissionsDone ?? 0) >= 5 },
+      { id: 'points', label: 'Tournament points ≥ 38', check: (w) => (w.tournament?.points ?? 0) >= 38 },
+      { id: 'first', label: 'First place on the final scoreboard', check: (w) => Boolean(w.tournament?.finished && w.tournament?.place === 1) }
+    ],
+    hints: [
+      'The rounds chain automatically as you clear them. Bad deploy → CI → ROLLBACK (fast!). Provider outage → ride it, claim the credit, postmortem. Data loss → CLOUD → Databases → RESTORE.',
+      'Points: 8 + 10 + 10 + 12 + 6 = 46. The rivals tick upward every few sim minutes — dawdle and Null Pointers will eat your lead.',
+      'The trophy round wants a calm board: no open incidents, all rounds done, ≥38 points. Then collect.'
+    ],
+    rewards: { cash: 6000, xp: { observability: 40, databases: 20, cicd: 20 } },
+    onStart: (w) => audit(w, 'system', 'game', 'Tournament continues: rollback round, provider-outage semifinal, and the database drop. Speed and honest postmortems score.'),
+    onComplete: (w) => audit(w, 'system', 'game', 'Champion. The trophy is a postmortem template — which is the point.')
+  },
+  // -------------------------------------------------------- 31
+  {
+    id: 'm31-challenge',
+    index: 31,
+    title: 'The constraints game',
+    phase: 'bonus',
+    story: 'The board discovered gamification. Attached to the annual review: three "challenges" — run the company under a hard constraint and get GRADED. An austerity clause (cut the bill 18%, hold it). A renewal audit (99.5% windowed availability, two days, pop quizzes included). And the auditors\' favorite: they drop your database at an unannounced time and stopwatch the restore.',
+    objective: 'MODES tab → Challenges: accept any one challenge and PASS it. Read the rule and the live scoreboard before you click accept — the clocks start immediately.',
+    coaching: 'Each challenge grades you daily on the constraint (budget cap, windowed availability floor, or RTO after a surprise disaster). Passed challenges pay $5,000 and count on your record; failed ones stay on the scoreboard. At 16× speed two sim days is a coffee break.',
+    skills: ['finops', 'observability', 'databases'],
+    requirements: [
+      { id: 'accepted', label: 'A challenge accepted (the clock ran)', check: (w) => Number(w.flags.challengesStarted ?? 0) >= 1 },
+      { id: 'passed', label: 'A challenge PASSED', check: (w) => Number(w.flags.challengesPassed ?? 0) >= 1 }
+    ],
+    hints: [
+      'Start with the austerity clause if the bill has fat left (reserved compute alone is −20%); the renewal audit if your platform is genuinely calm; the RTO one if your backups are on (they are — mission 20).',
+      'Watch the live scoreboard in MODES: budget shows bill vs cap; availability shows windowed % and bad minutes; RTO shows the countdown you cannot see (the disaster lands 3–9 sim hours in — keep backups on and react fast).',
+      'Failed a challenge? The scar stays but you can re-accept. Each pass pays $5,000.'
+    ],
+    rewards: { cash: 5000, xp: { finops: 30, observability: 30 } },
+    onStart: (w) => audit(w, 'board', 'game', 'The board: "We gamified your KPIs. You\'re welcome." Three challenges are live in the MODES tab — constraints with scoreboards.'),
+    onComplete: (w) => audit(w, 'system', 'game', 'Passed under constraint. The scoreboard respects operators who can hold a line, not just cross one.')
+  },
+  // -------------------------------------------------------- 32
+  {
+    id: 'm32-access',
+    index: 32,
+    title: 'Everyone ships',
+    phase: 'bonus',
+    story: 'Two tickets land the same morning. One, from a power user: "I use a screen reader; your incident banner is a wall of emoji and vibes." Two, from the German enterprise buyer: "Können wir das Dashboard auf Deutsch haben?" Accessibility and localization are not favors. They are the product working for everyone.',
+    objective: 'MODES tab → Access & language: turn on at least one accessibility option (high contrast, large text, reduced motion — Alt+1…9,0 switches tabs) and switch the interface language from English. Then ship like it\'s normal, because it is.',
+    coaching: 'The toggles apply instantly and persist per browser; tab shortcuts work everywhere. The interface chrome localizes (es/de); the terminal stays POSIX — some traditions are sacred.',
+    skills: ['architecture'],
+    requirements: [
+      { id: 'a11y', label: 'An accessibility option enabled', check: (w) => Boolean(w.flags.a11yUsed) },
+      { id: 'locale', label: 'Interface language switched (es or de)', check: (w) => typeof w.flags.locale === 'string' && w.flags.locale !== 'en' }
+    ],
+    hints: [
+      'MODES tab → ACCESS & LANGUAGE: flip any toggle (high contrast is the most visible). Alt+1…9 and Alt+0 switch tabs without the mouse.',
+      'Same panel: Sprache / idioma — pick Español or Deutsch. The chrome re-renders immediately; the change is saved to your company file.',
+      'Both done? The mission completes on the next heartbeat — the toggles post to the server when you change them.'
+    ],
+    rewards: { cash: 8000, xp: { architecture: 40 } },
+    onStart: (w) => audit(w, 'support', 'game', 'Two tickets: a screen-reader user and a German enterprise account. Everyone ships — or it is not everyone.'),
+    onComplete: (w) => {
+      w.flags.scalePhaseComplete = true;
+      audit(w, 'system', 'game', 'P4 MILESTONE COMPLETE — 32 missions, four phases. You built the platform, ran the company, scaled the ecosystem, and made it work for everyone. SHIP IT. (Sandbox, challenges and packs remain — the world keeps happening.)');
     }
   }
-];
-
-// Phase-2 designed missions (data only — validators arrive with the systems)
-export const PHASE2_MISSIONS: { id: string; title: string; concept: string }[] = [
-  { id: 'm17-e2e', title: 'Clicking on purpose', concept: 'end-to-end tests + staging environment + approvals' },
-  { id: 'm18-terraform', title: 'Under new management', concept: 'Terraform: import manual infra, plan/apply, drift' },
-  { id: 'm19-k8s', title: 'Pods of plenty', concept: 'Kubernetes: Deployments, Services, Ingress, probes, HPA' },
-  { id: 'm20-dr', title: 'Out of region, out of mind', concept: 'backups, RPO/RTO, restore drills, regional failover' }
 ];
