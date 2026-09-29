@@ -166,6 +166,8 @@ export interface ManagedPostgres {
   seqScansPerSec: number;
   /** connection pooler (pgbouncer) fronting the DB (P5b, optional) */
   pooler?: boolean;
+  /** read replica (P6b): takes a share of reads off the primary, lags under read load */
+  replica?: { plan: 'db.micro' | 'db.small' | 'db.medium'; addedAtMin: number };
   backups: DbBackupState;
 }
 
@@ -361,6 +363,8 @@ export interface Engineer {
   role: EngineerRole;
   salaryMonthly: number;
   hiredAtMin: number;
+  /** era (P6c): 0–100, accrues when pages outpace the team; 100 = they quit */
+  burnout?: number;
 }
 
 export interface TeamState {
@@ -439,6 +443,8 @@ export interface CloudState {
   compared: boolean;          // ran the cost comparison (gates migration)
   lastComparison?: { provider: string; region: string; monthlyCost: number; note: string }[];
   outage?: ProviderOutage;    // active provider outage, if any
+  /** secondary-region standby (P6b): ~50% footprint duplication, real failover */
+  secondary?: { provider: string; region: string; sinceMin: number };
   outagesSeen: number;
   creditsTotal: number;       // SLA credits claimed, in dollars
   migration?: MigrationState; // in-flight migration
@@ -459,6 +465,8 @@ export interface Product {
   requires?: { slos?: boolean; satisfaction?: number; teamSize?: number };
   startedAtMin?: number;
   launchedAtMin?: number;
+  /** era (P6d): live products ramp toward their peak, mature, then decay — refresh to reset */
+  lifecycle?: { peakAdoptionPct: number; matureAtMin: number; generation: number };
 }
 
 export interface ProductState {
@@ -625,6 +633,63 @@ export interface EndgameState {
   pillars: DueDiligencePillar[];
 }
 
+// ---------- Scale Era (P6) ----------
+/**
+ * Set when the m40 term sheet is accepted. Every load-coupled cost item and
+ * compute-utilization effect keys off this field's existence, so mid-campaign
+ * balance is untouched. Grows in later P6 phases (stage, rivals, scoreboard).
+ */
+export interface EraState {
+  startedAtMin: number;
+  /** highest scale stage announced so far (derived from users, watermarked for the audit feed) */
+  stageReached?: number;
+  /** era (P6c): cumulative refunds & SLA credits paid out for incidents */
+  incidentCashPaid?: number;
+  /** era (P6c): when the current on-call overload episode began (audit watermark) */
+  overloadSinceMin?: number;
+  /** era (P6c): the coordination tax announces itself once */
+  coordinationWarned?: boolean;
+  /** era (P6d): R&D level 0–5, each +8% growth (the money sink) */
+  rdLevel?: number;
+  /** era (P6d): when the next product idea lands in the backlog */
+  nextIdeaAtMin?: number;
+  /** era (P6d): how many backlog ideas have been added so far */
+  ideasAdded?: number;
+  /** era (P6e): the three rival companies racing you */
+  rivals?: EraRival[];
+  /** era (P6e): milestone badges granted so far */
+  badges?: string[];
+  /** era (P6e): when the current rival-poaching episode began (audit watermark) */
+  poachSinceMin?: number;
+}
+
+/** A rival company (P6e): deterministic archetype, grows/outages/publishes postmortems on the same tick. */
+export interface EraRival {
+  id: string;
+  name: string;
+  archetype: 'goliath' | 'lean' | 'steady';
+  users: number;
+  /** rolling 30-day outage minutes — decays like the player's uptime window */
+  badMin: number;
+  outages: number;
+  postmortems: number;
+  outagedUntilMin?: number;
+}
+
+/** CDN/edge cache (P6b): offloads a hit-ratio share of requests from the origin. */
+export interface CdnState {
+  tier: 'basic' | 'pro';
+  enabledAtMin: number;
+  /** cache stampede in progress until this sim minute (S2 pressure) */
+  stampedeUntilMin?: number;
+}
+
+/** Async queue + workers (P6b): peak-shaves writes; undersized pools build backlog. */
+export interface QueueState {
+  workers: number;
+  backlog: number;
+}
+
 // ---------- Backups / DR ----------
 export interface DbSnapshot {
   atMin: number;
@@ -770,6 +835,12 @@ export interface World {
   traces?: Trace[];
   /** acquisition endgame (P5b) */
   endgame?: EndgameState;
+  /** scale era (P6a): absent until the m40 term sheet is accepted */
+  era?: EraState;
+  /** edge CDN (P6b): absent until enabled */
+  cdn?: CdnState;
+  /** async workers (P6b): absent until the first worker is hired */
+  queue?: QueueState;
   economy: { lineItems: CostLineItem[]; payrollMonthly: number; revenueToday: number; costHistory: { day: number; infra: number; revenue: number }[] };
   audit: AuditEvent[];
   flags: Flags;

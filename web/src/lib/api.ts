@@ -69,6 +69,30 @@ export interface GameView {
   }[];
   openIncident: unknown;
   costs: { lineItems: { category: string; label: string; monthlyCost: number; provider?: string }[]; monthlyTotal: number; payroll: number };
+  era: {
+    startedAtMin: number;
+    stageReached: number;
+    burn: {
+      monthlyInfra: number; payroll: number; mrr: number; marginPct: number;
+      hourlyBurn: number; projectedMonthEnd: number; costPerUser: number; revenuePerUser: number;
+      reqsMonthly: number; billedReqsMonthly: number; egressGB: number; logGB: number;
+      capacity: number; utilAvgPct: number; utilPeakPct: number;
+      stage: number; cdnHitPct: number; queueBacklog: number; replicaLagMs: number; failoverReady: boolean;
+    };
+    cdn: { tier: 'basic' | 'pro'; stampede: boolean } | null;
+    queue: { workers: number; backlog: number } | null;
+    secondary: { provider: string; region: string } | null;
+    oncall: { demandMin: number; supplyMin: number; discountPct: number; ratioPct: number; overloaded: boolean; fleetUnits: number; openIncidents: number };
+    incidentCashPaid: number;
+    eraDay: number;
+    growthMult: number;
+    nextStageUsers: number | null;
+    rdLevel: number;
+    rdNextCost: number | null;
+    race: { rows: { id: string; name: string; you: boolean; archetype: string; users: number; mrr: number; marginPct: number; robustness: number; valuation: number; index: number }[]; playerRank: number; gapToNext: number | null };
+    badges: string[];
+    shareCode: string;
+  } | null;
   audit: { t: number; actor: string; kind: string; text: string }[];
   hosts: { id: string; ip: string; label: string; os: string }[];
   session: { hostId: string; user: string; cwd: string; pending: boolean; prompt: string };
@@ -88,6 +112,7 @@ export interface GameView {
   db: {
     provisioned: boolean; plan: string; endpoint: string; cpu: number; connections: number;
     migrationsDone: boolean; pooler: boolean; tables: { name: string; rows: number; indexes: string[] }[];
+    replica: { plan: string; lagMs: number } | null;
     backups: {
       enabled: boolean; retentionDays: number;
       snapshots: { atMin: number; label: string; ordersRows: number }[];
@@ -95,7 +120,7 @@ export interface GameView {
     };
   };
   k8s: null | {
-    name: string; version: string; ip: string; serving: boolean; zeroDowntimeProven: boolean;
+    name: string; version: string; ip: string; serving: boolean; zeroDowntimeProven: boolean; nodes: number;
     deployments: { name: string; image: string; replicas: number; ready: number; revision: number; strategy: string; readinessProbe: boolean; livenessProbe: boolean }[];
     pods: { name: string; phase: string; restarts: number; node: string; revision: number }[];
     services: { name: string; type: string; port: number; targetPort: number; selector: string; ingressIp: string | null }[];
@@ -109,7 +134,7 @@ export interface GameView {
     lastPlanClean: boolean; driftDetected: boolean; driftResolved: boolean;
   };
   team: {
-    engineers: { id: string; name: string; role: string; salary: number; roleLabel: string }[];
+    engineers: { id: string; name: string; role: string; salary: number; roleLabel: string; burnout: number }[];
     onCallId: string | null;
     roles: { id: string; label: string; salary: number; blurb: string; debtPerDay: number }[];
   };
@@ -142,6 +167,7 @@ export interface GameView {
       infraMonthly: number; buildCost: number; buildHours: number;
       requires: { slos?: boolean; satisfaction?: number; teamSize?: number } | null;
       blockers: string[]; startedAtMin: number | null; launchedAtMin: number | null; progress: number | null; mrr: number | null;
+    lifecycle: { generation: number; phase: 'ramping' | 'decaying'; matureInDays: number; refreshCost: number } | null;
     }[];
     productMrr: number; baseMrr: number;
   };
@@ -313,7 +339,23 @@ export const api = {
   dbPooler: (id: string) =>
     fetch(`/api/games/${id}/db/pooler`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r)),
   endgameAccept: (id: string) =>
-    fetch(`/api/games/${id}/endgame/accept`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r))
+    fetch(`/api/games/${id}/endgame/accept`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  cdnSet: (id: string, tier: 'basic' | 'pro' | 'off') =>
+    fetch(`/api/games/${id}/cloud/cdn`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tier }) }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  queueSet: (id: string, workers: number) =>
+    fetch(`/api/games/${id}/cloud/queue`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workers }) }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  replicaSet: (id: string, plan: 'db.micro' | 'db.small' | 'db.medium' | 'off') =>
+    fetch(`/api/games/${id}/db/replica`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plan }) }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  secondarySet: (id: string, provider: string, region: string) =>
+    fetch(`/api/games/${id}/cloud/secondary`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider, region }) }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  secondaryRemove: (id: string) =>
+    fetch(`/api/games/${id}/cloud/secondary`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ remove: true }) }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  eraCrank: (id: string) =>
+    fetch(`/api/games/${id}/era/crank`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  eraRd: (id: string) =>
+    fetch(`/api/games/${id}/era/rd`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r)),
+  productRefresh: (id: string, productId: string) =>
+    fetch(`/api/games/${id}/products/${productId}/refresh`, { method: 'POST' }).then((r) => j<{ ok: boolean; message: string }>(r))
 };
 
 export interface FsEntry { name: string; type: string; sizeMB: number; owner: string; mode: string; children?: FsEntry[] }

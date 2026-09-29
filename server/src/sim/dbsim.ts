@@ -282,17 +282,19 @@ function execSelect(world: World, plan: SelectPlan): QueryResult {
   return { columns: cols, rows: out, rowCount: out.length, commandTag: 'SELECT' };
 }
 
+/** Pure db-CPU curve for a plan at a given query rate — shared by the tick loop and the P6a utilization surcharge. */
+export function dbCpuFor(plan: string, qps: number, hasIdx: boolean): number {
+  const cap = ({ 'db.micro': 1, 'db.small': 1.8, 'db.medium': 3.6 })[plan] ?? 1;
+  const seqCost = hasIdx ? 0 : qps * 1.15; // each seq scan is expensive
+  return Math.min(99, 4 + (qps * (hasIdx ? 0.35 : 0.12)) / cap + seqCost / cap);
+}
+
 /** Model DB CPU for the tick loop. */
 export function updateDbCpu(world: World, reqRate: number): void {
   if (!world.db.provisioned) return;
-  const plans: Record<string, number> = { 'db.micro': 1, 'db.small': 1.8, 'db.medium': 3.6 };
-  const cap = plans[world.db.plan] ?? 1;
   const qps = reqRate; // ~1 orders query per request
-  const hasIdx = world.flags.indexFixApplied || Boolean(findIndex(world, 'orders', 'status'));
-  const seqCost = hasIdx ? 0 : qps * 1.15; // each seq scan is expensive
-  const base = 4 + (qps * (hasIdx ? 0.35 : 0.12)) / cap;
-  const cpu = Math.min(99, base + seqCost / cap);
-  world.db.cpuPct = Math.round(cpu * 10) / 10;
+  const hasIdx = Boolean(world.flags.indexFixApplied) || Boolean(findIndex(world, 'orders', 'status'));
+  world.db.cpuPct = Math.round(dbCpuFor(world.db.plan, qps, hasIdx) * 10) / 10;
   world.db.seqScansPerSec = hasIdx ? 0 : Math.round(qps);
   world.db.connections = Math.min(97, 4 + Math.round(qps / 8));
 }

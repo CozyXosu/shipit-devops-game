@@ -327,6 +327,66 @@ mission-chain integration test.
   a live scoreboard; accessibility & localization (m32): high contrast, large
   text, reduced motion, Alt+1…9/0 tab navigation, aria-live terminal and
   status regions, and interface chrome in English/Spanish/German.
+- **P6 (in progress — the Scale Era, see `docs/P6-SCALE-ERA.md`):** makes the
+  game endless on purpose after the acquisition. **6a (shipped): the honest
+  economy** — accepting the m40 term sheet starts `world.era`, which turns on
+  load-coupled billing (L7 requests with a 2B/mo included tier, egress at
+  8 KB/req, log ingestion, backup object storage, a managed-DB utilization
+  surcharge above 70% CPU) and real compute utilization: every VM/node serves
+  ~200 req/s, latency bends above 70% fleet utilization, overload past 100%
+  becomes 5xx, and the k8s node pool can scale to 500 nodes (2–4 in the
+  campaign). The COSTS tab grows a live burn view ($/sim-hour, projected
+  month-end, cost per user, margin, fleet utilization). **6b (shipped):
+  capacity levers + scale stages** — four era levers, each answering one
+  pressure: a CDN/edge cache (basic 60% / pro 85% hit ratio; edge hits never
+  touch the origin bill, egress or fleet), async queue workers ($35/mo each,
+  40 jobs/s drained — writes beyond the drain wait in a backlog instead of
+  hammering the DB), a read replica (~60% of reads off the primary, with real
+  replication lag that turns into stale reads past 250 ms), and a secondary
+  region (footprint ×1.5 with half-size standby — a regional outage now fails
+  over through a 3-minute DNS glitch instead of ending the world). The stage
+  engine derives S1–S5 from users (10k/100k/1M/10M/100M), announces each once
+  in the audit feed, and turns on the pressure: cache stampedes at S2, write
+  share 0.2→0.35 and 100× log growth at S3, 1000× logs at S4, composite
+  crises on random timers at S5. The tuning gate now pins both curves: naive
+  infra/revenue ≈12% at 100k → ≈43% at 1M → ≈46% at 10M; engineered (all
+  levers pulled) holds ≤25% at any scale. **6c (shipped): consequences of
+  being big** — incidents now cost cash directly (resolving debits refunds &
+  SLA credits at $0.03/user-hour for a Sev-1, $0.01 for a Sev-2 — at 1M users
+  a Sev-1 hour is a $30k ledger event); the on-call load is the engineer-
+  minutes economy: demand = fleet×15 + open incidents×90 + debt×8 minutes/day,
+  discounted by automation (developer portal −25%, each published golden path
+  −3%, written SLOs −10%), and when pages outpace the team engineers accrue
+  burnout — at 100% they quit, dragging satisfaction with them (the era lifts
+  the 6-engineer hiring cap to 40). Beyond ~6 engineers without the portal,
+  the coordination tax plants deploy regressions with odds scaling with
+  headcount. Single-region fleets at S3+ draw provider outages at double odds
+  and carry a `single-region` compliance finding, and enterprise-tier product
+  revenue drops 30% while any compliance finding is open — posture gates
+  revenue. The COMPANY tab shows the on-call load meter, per-engineer
+  burnout, and the incident ledger total. **6d (shipped): the era mode** —
+  growth paces like an incremental game (stage-scaled multiplier ×12 at S2 up
+  to ×21 at S5, plus a CRANK A DAY control that fast-forwards a sim day and
+  lets the world happen at you), R&D lands as the money sink (five levels,
+  $50k escalating, +8% growth each), and the product pipeline comes alive:
+  era products ramp toward a peak adoption, mature after 30 days, then decay
+  — SHIP v-next refresh releases reset the decay and raise the ceiling — and
+  a new backlog idea accrues every 10 sim days up to a 12-product catalog.
+  The MODES tab legend section is now the Scale Era panel (era day, stage,
+  next milestone, crank, R&D). **6e (shipped): the race** — three rival
+  archetypes run the same market on the same tick: Goliath Cloud buys scale
+  with money (fast growth, 42% margin, rare outages), Leanframe runs lean and
+  fragile (best margin, big outages), Steady Systems is boring and reliable;
+  they publish postmortems and poach your users whenever your error rate
+  burns. The Robustness Rating (0–100) scores availability vs 99%, error
+  budget, MTTR, days since Sev-1 and blast-radius containment; live valuation
+  = annual MRR × a 3–9.5× robustness-and-growth multiple (the m40 term sheet,
+  every day); the Ship It Index is robustness-weighted worth, so robust
+  systems literally rank richer. Milestones ($1M MRR club, 99.99% held at
+  1M users, provider outage survived with zero downtime, margin ≤25% at 10M,
+  the 100M summit) land as badges, and any-moment run summaries compress into
+  offline-decodable share codes (SI-…). **P6 complete — the game is endless
+  on purpose.**
 
 ## 13. Definition of Done — slice checklist
 

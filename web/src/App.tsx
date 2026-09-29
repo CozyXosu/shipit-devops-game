@@ -237,7 +237,7 @@ function GameShell({ gameId, view, setView, onExit, t, locale, setLocale, a11y, 
           {tab === 'editor' && <Editor game={gameId} view={view} refresh={refresh} />}
           {tab === 'dashboard' && <Dashboard view={view} />}
           {tab === 'ci' && <CiView game={gameId} view={view} refresh={refresh} />}
-          {tab === 'k8s' && <K8sView view={view} />}
+          {tab === 'k8s' && <K8sView game={gameId} view={view} refresh={refresh} />}
           {tab === 'database' && <DbView game={gameId} view={view} refresh={refresh} />}
           {tab === 'monitoring' && <Monitoring game={gameId} view={view} refresh={refresh} />}
           {tab === 'cloud' && <Cloud game={gameId} view={view} refresh={refresh} />}

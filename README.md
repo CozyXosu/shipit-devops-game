@@ -2,7 +2,8 @@
 
 A learn-by-doing DevOps game. You are the first platform hire of a tiny startup:
 one broken Linux server, a demo at 10:30, no CI, no monitoring, no backups.
-Build the platform. Then run the company — all the way to the acquisition.
+Build the platform. Then run the company — through the acquisition and into
+the endless Scale Era.
 
 ![Dashboard](docs/img/dashboard.png)
 
@@ -33,12 +34,12 @@ npm run dev:web        # Vite dev server on :5173 (proxies /api)
 Tests:
 
 ```bash
-npm test               # 159 tests across 15 suites, incl. a full m01→m40 mission-chain integration test
+npm test               # 224 tests across 18 suites, incl. a full m01→m40 mission-chain integration test and the Scale Era economy
 ```
 
 Requires Node 18+ (`node` on PATH).
 
-## The game — 40 missions, five phases
+## The game — 40 missions, five phases, then the Scale Era
 
 - **BUILD (missions 1–20):** SSH & Linux forensics → systemd → permissions →
   nginx reverse proxy → DNS → git (with a real merge conflict) → secrets →
@@ -84,7 +85,29 @@ Requires Node 18+ (`node` on PATH).
   self-service deploys · **ephemeral preview environments** per CI run ·
   **distributed tracing** with latency attribution and a pgbouncer fix · the
   **acquisition capstone** — five-pillar due diligence over real world state, a
-  term sheet, an announcement scale event, then endless legend mode.
+  term sheet, an announcement scale event.
+- **THE SCALE ERA (after 40 — endless, no authored missions):** the sale is
+  the starting gun. The **honest economy**: infra bills by usage — requests
+  (first 2B/mo included), egress, log ingestion, backup storage, a managed-DB
+  surcharge above 70% CPU — every VM/node serves ~200 req/s (latency bends at
+  70% fleet utilization, overload past 100% is 5xx), and the COSTS tab shows a
+  live burn view ($/sim-hour, projected month-end, cost per user, margin) ·
+  **capacity levers**: a CDN whose edge hits never touch your origin bill,
+  async queue workers with real backlogs, a read replica with replication lag
+  (stale reads past 250 ms), a secondary region with genuine failover ·
+  **scale stages S1–S5** (10k → 100M users) emerge from traffic: cache
+  stampedes, a heavier write mix, log growth that re-opens the logrotate
+  lesson at 100×/1000×, composite crises on random timers · **consequences of
+  being big**: resolving an incident debits a refund ledger scaled to your
+  users, the on-call load is an engineer-minutes economy (portal, golden paths
+  and SLOs buy minutes back; 100% burnout = resignation), teams past six
+  engineers without a portal ship regressions, and enterprise revenue drops
+  while compliance findings are open · **era mode**: stage-scaled growth
+  pacing, CRANK A DAY, R&D as a money sink, and a product pipeline that lives
+  (ramp → mature → decay → refresh releases) while new ideas accrue in the
+  backlog · **the race**: three rival companies with distinct strategies, a
+  0–100 Robustness Rating, live valuation, the robustness-weighted Ship It
+  Index, milestone badges, and offline-decodable share codes.
 - Requirements are checked against **world state**, not clicks. Hints are
   progressive and cost rating (S/A/B/C). Failure is content: broken YAML gives
   you CrashLoop-style symptoms to debug.
@@ -130,8 +153,8 @@ Requires Node 18+ (`node` on PATH).
 | `sim/cloud.ts` | Fictional cloud providers (Stratus/Volt/Orbit): regional price × reliability × latency catalog, footprint multipliers, SLA-credit and cutover-downtime math |
 | `sim/dbsim.ts` | Postgres subset with EXPLAIN: Seq Scan → Index Scan changes live DB CPU; pgbouncer pooler |
 | `sim/vault.ts` | Secrets manager: generated secrets, dynamic DB credentials, zero-downtime rotation, leak scan |
-| `world.ts` | Tick engine (simulated minutes): traffic, metrics, alerts, incidents (incl. data-loss DR drills), backups, team/on-call, technical debt, canary lifecycle, SLOs, marketing, provider outages, migrations, products, FinOps budgets & recommendations, zero-trust mesh, compliance findings, developer portal, traces, acquisition endgame — economy, audit |
-| `engine.ts` + `missions/` | Data-driven missions across five phases, validators over world state, hints, ratings, free lessons, auto-solve walkthroughs |
+| `world.ts` | Tick engine (simulated minutes): traffic, metrics, alerts, incidents (incl. data-loss DR drills), backups, team/on-call with burnout, technical debt, canary lifecycle, SLOs, marketing, provider outages, migrations, products with lifecycles, FinOps budgets & recommendations, zero-trust mesh, compliance findings, developer portal, traces, acquisition endgame, and the scale-era economy — usage billing, capacity levers (CDN/queue/replica/multi-region), stage engine, on-call load, rivals and race boards — economy, audit |
+| `engine.ts` + `missions/` | Data-driven missions across five phases plus the endless era, validators over world state, hints, ratings, free lessons, auto-solve walkthroughs |
 
 ## Persistence
 
@@ -156,7 +179,9 @@ on-call, technical debt, canary/blue-green, SLOs, PostgreSQL storage) · P3
 ecosystem (multi-cloud providers, migrations, products, FinOps) · P4 modes at
 scale (challenge mode, mission packs + postmortem tournament, accessibility,
 EN/ES/DE) · P5 trust & scale (vault, zero trust, supply chain, compliance,
-developer portal, preview environments, tracing, acquisition capstone).
+developer portal, preview environments, tracing, acquisition capstone) · P6
+the Scale Era (honest economy, capacity levers + scale stages, consequences
+of being big, era mode, the race) — the game is endless on purpose.
 
 ### Mission packs (P4)
 

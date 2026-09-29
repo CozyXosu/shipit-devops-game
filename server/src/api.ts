@@ -2,7 +2,7 @@
 import { Router, Request, Response } from 'express';
 import { GameState, OutLine } from './types';
 import { Storage } from './state';
-import { createWorld, tick, audit, costLineItems, monthlyInfraCost, uptimePct, addDnsRecord, allowPort, provisionDb, resizeDb, runMigrations, resizeDisk, installMonitoringAgent, addAlertRule, removeAlertRule, filePostmortem, metricsView, diskUsagePct, provisionVm, deployToVm, provisionLb, haReady, provisionK8sCluster, enableBackups, restoreBackup, hireEngineer, fireEngineer, setOnCall, runMarketingCampaign, startRefactorProject, configureSlos, sloReport, promoteCanary, abortCanary, ensureDebt, ensureTeam, ensureSlos, payrollOf, ROLE_INFO, runCloudComparison, claimSlcCredit, startMigration, decommissionVm, ensureProducts, startProduct, productBlockers, productMrrOf, baseMrrOf, ensureFinops, setFinopsBudget, reserveCompute, finopsRecommendations, startChallenge, abandonChallenge, challengeLive, setPlayerSettings } from './world';
+import { createWorld, tick, audit, costLineItems, monthlyInfraCost, eraBurnView, replicaLagMsOf, oncallLoadOf, eraGrowthMultOf, nextStageUsersOf, investRd, crankDay, refreshProduct, refreshCostOf, raceBoardOf, shareCodeOf, setCdn, setQueueWorkers, setReplica, setSecondaryRegion, uptimePct, addDnsRecord, allowPort, provisionDb, resizeDb, runMigrations, resizeDisk, installMonitoringAgent, addAlertRule, removeAlertRule, filePostmortem, metricsView, diskUsagePct, provisionVm, deployToVm, provisionLb, haReady, provisionK8sCluster, enableBackups, restoreBackup, hireEngineer, fireEngineer, setOnCall, runMarketingCampaign, startRefactorProject, configureSlos, sloReport, promoteCanary, abortCanary, ensureDebt, ensureTeam, ensureSlos, payrollOf, ROLE_INFO, runCloudComparison, claimSlcCredit, startMigration, decommissionVm, ensureProducts, startProduct, productBlockers, productMrrOf, baseMrrOf, ensureFinops, setFinopsBudget, reserveCompute, finopsRecommendations, startChallenge, abandonChallenge, challengeLive, setPlayerSettings } from './world';
 import { runTerminalInput } from './sim/host';
 import { resolveHostname, parseNginxSites, lbBackends, hostServesApi } from './sim/net';
 import { runPipeline, rollback, approveRun } from './sim/ci';
@@ -227,6 +227,68 @@ export function createApi(storage: Storage): Router {
     evaluateMissions(state);
     await storage.save(state);
     res.json({ ok: true, db: state.world.db });
+  });
+
+  // ---- era capacity levers (P6b) ----
+  api.post('/games/:id/cloud/cdn', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const tier = req.body?.tier === 'basic' || req.body?.tier === 'pro' ? req.body.tier : 'off';
+    const result = setCdn(state.world, tier);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/cloud/queue', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = setQueueWorkers(state.world, Number(req.body?.workers ?? 0));
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/db/replica', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const raw = req.body?.plan;
+    const plan = raw === null || raw === 'off' ? null : raw === 'db.medium' || raw === 'db.micro' ? raw : 'db.small';
+    const result = setReplica(state.world, plan);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/era/crank', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = crankDay(state.world);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/era/rd', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = investRd(state.world);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/products/:productId/refresh', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = refreshProduct(state.world, req.params.productId);
+    await storage.save(state);
+    res.json(result);
+  });
+
+  api.post('/games/:id/cloud/secondary', async (req, res) => {
+    const state = await storage.load(req.params.id);
+    if (!state) return res.status(404).json({ error: 'game not found' });
+    const result = req.body?.remove
+      ? setSecondaryRegion(state.world, null, '')
+      : setSecondaryRegion(state.world, String(req.body?.provider ?? 'stratus'), String(req.body?.region ?? 'us-west-1'));
+    await storage.save(state);
+    res.json(result);
   });
 
   api.post('/games/:id/cloud/disk', async (req, res) => {
@@ -779,6 +841,24 @@ export function createApi(storage: Storage): Router {
       incidents: w.monitoring.incidents,
       openIncident,
       costs: { lineItems: costLineItems(w), monthlyTotal: monthlyInfraCost(w), payroll: payrollOf(w) },
+      era: w.era ? {
+        startedAtMin: w.era.startedAtMin,
+        stageReached: w.era.stageReached ?? 0,
+        burn: eraBurnView(w),
+        cdn: w.cdn ? { tier: w.cdn.tier, stampede: Boolean(w.cdn.stampedeUntilMin && w.nowMin < w.cdn.stampedeUntilMin) } : null,
+        queue: w.queue ? { workers: w.queue.workers, backlog: Math.round(w.queue.backlog) } : null,
+        secondary: w.cloud?.secondary ? { provider: w.cloud.secondary.provider, region: w.cloud.secondary.region } : null,
+        oncall: oncallLoadOf(w),
+        incidentCashPaid: Math.round(w.era.incidentCashPaid ?? 0),
+        eraDay: Math.floor((w.nowMin - w.era.startedAtMin) / 1440),
+        growthMult: Math.round(eraGrowthMultOf(w) * 100) / 100,
+        nextStageUsers: nextStageUsersOf(w),
+        rdLevel: w.era.rdLevel ?? 0,
+        rdNextCost: (w.era.rdLevel ?? 0) >= 5 ? null : 50_000 * ((w.era.rdLevel ?? 0) + 1),
+        race: raceBoardOf(w),
+        badges: w.era.badges ?? [],
+        shareCode: shareCodeOf(w).code
+      } : null,
       audit: w.audit.slice(-80).reverse(),
       hosts: Object.values(w.hosts).map((h) => ({ id: h.id, ip: h.ip, label: h.label, os: h.os })),
       session: sessionView(state),
@@ -799,6 +879,7 @@ export function createApi(storage: Storage): Router {
         provisioned: w.db.provisioned, plan: w.db.plan, endpoint: w.db.endpoint,
         cpu: w.db.cpuPct, connections: w.db.connections, migrationsDone: w.db.migrationsDone,
         pooler: Boolean(w.db.pooler),
+        replica: w.db.replica ? { plan: w.db.replica.plan, lagMs: replicaLagMsOf(w) } : null,
         tables: Object.values(w.db.tables).map((t) => ({ name: t.name, rows: t.rowCount, indexes: t.indexes.map((i) => `${i.name}(${i.columns.join(',')})`) })),
         backups: {
           enabled: w.db.backups.enabled,
@@ -833,7 +914,7 @@ export function createApi(storage: Storage): Router {
       team: (() => {
         const team = ensureTeam(w);
         return {
-          engineers: team.engineers.map((e) => ({ id: e.id, name: e.name, role: e.role, salary: e.salaryMonthly, roleLabel: ROLE_INFO[e.role]?.label ?? e.role })),
+          engineers: team.engineers.map((e) => ({ id: e.id, name: e.name, role: e.role, salary: e.salaryMonthly, roleLabel: ROLE_INFO[e.role]?.label ?? e.role, burnout: Math.round(e.burnout ?? 0) })),
           onCallId: team.onCallId,
           roles: Object.entries(ROLE_INFO).map(([id, r]) => ({ id, ...r }))
         };
@@ -917,14 +998,20 @@ export function createApi(storage: Storage): Router {
         return {
           products: ps.products.map((p) => ({
             id: p.id, name: p.name, tagline: p.tagline, tier: p.tier,
-            pricePerUserMonthly: p.pricePerUserMonthly, adoptionPct: p.adoptionPct, infraMonthly: p.infraMonthly,
+            pricePerUserMonthly: p.pricePerUserMonthly, adoptionPct: Math.round(p.adoptionPct * 10) / 10, infraMonthly: p.infraMonthly,
             buildCost: p.buildCost, buildHours: Math.round(p.buildDurationMin / 60),
             requires: p.requires ?? null,
             blockers: p.startedAtMin === undefined && p.launchedAtMin === undefined ? productBlockers(w, p) : [],
             startedAtMin: p.startedAtMin ?? null,
             launchedAtMin: p.launchedAtMin ?? null,
             progress: p.startedAtMin !== undefined && p.launchedAtMin === undefined ? Math.min(100, Math.round(((w.nowMin - p.startedAtMin) / p.buildDurationMin) * 100)) : null,
-            mrr: p.launchedAtMin !== undefined ? Math.round(w.company.users * (p.adoptionPct / 100) * p.pricePerUserMonthly) : null
+            mrr: p.launchedAtMin !== undefined ? Math.round(w.company.users * (p.adoptionPct / 100) * p.pricePerUserMonthly) : null,
+            lifecycle: p.launchedAtMin !== undefined && p.lifecycle ? {
+              generation: p.lifecycle.generation,
+              phase: w.nowMin < p.lifecycle.matureAtMin ? 'ramping' : 'decaying',
+              matureInDays: Math.max(0, Math.ceil((p.lifecycle.matureAtMin - w.nowMin) / 1440)),
+              refreshCost: refreshCostOf(p)
+            } : null
           })),
           productMrr: Math.round(productMrrOf(w)),
           baseMrr: Math.round(baseMrrOf(w))

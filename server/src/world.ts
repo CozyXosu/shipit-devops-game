@@ -1,10 +1,10 @@
 // World: creation (seed state), the tick engine (simulated time), incidents,
 // economy, cloud-console actions, and audit. This module is the "game engine"
 // the REST API drives.
-import { World, GameState, Incident, AlertRule, MetricPoint, OutLine, Engineer, EngineerRole, RefactorProject, TeamState, DebtState, SloState, CloudState, Product, ProductState, FinOpsState, CostLineItem, ChallengeRunState, TournamentState, ZeroTrustState, ComplianceState, ComplianceFinding, EvidenceBundle, PortalState, Trace, EndgameState, DueDiligencePillar } from './types';
+import { World, GameState, Incident, AlertRule, MetricPoint, OutLine, Engineer, EngineerRole, RefactorProject, TeamState, DebtState, SloState, CloudState, Product, ProductState, FinOpsState, CostLineItem, ChallengeRunState, TournamentState, ZeroTrustState, ComplianceState, ComplianceFinding, EvidenceBundle, PortalState, Trace, EndgameState, DueDiligencePillar, EraRival } from './types';
 import { makeHost, addProcess } from './sim/host';
 import * as fs from './sim/fs';
-import { updateDbCpu, seedTables } from './sim/dbsim';
+import { updateDbCpu, dbCpuFor, seedTables } from './sim/dbsim';
 import { lbBackends, hostServesApi } from './sim/net';
 import { hashStr } from './sim/docker';
 import { tickK8s, provisionCluster, resizeNodePool, k8sServes, imageSigned } from './sim/k8s';
@@ -268,7 +268,13 @@ function errorSourcesOf(world: World): { n: number; disk: boolean; bad: boolean;
   const db = world.db.provisioned && world.db.cpuPct > 90 && !hasStatusIndex(world);
   const drill = Boolean(world.flags.web01Down) && !haReady(world);
   const dataLoss = (world.db.tables['orders']?.rowCount ?? 1) === 0;
-  return { n: (disk ? 2 : 0) + (bad ? 3 : 0) + (db ? 1 : 0) + (drill ? 3 : 0) + (dataLoss ? 4 : 0), disk, bad, db, drill, dataLoss };
+  // era (P6a): serving past fleet capacity melts the origin — overload becomes 5xx
+  const util = world.era ? computeUtilOf(world) : 0;
+  const overload = util > 1 ? Math.ceil((util - 1) * 12) : 0;
+  // era (P6b): a lagging replica serves stale data; an undersized queue parks checkouts
+  const stale = replicaLagMsOf(world) > ERA_ECON.staleReadLagMs ? 1 : 0;
+  const backedUp = world.queue && world.queue.backlog > 20_000 ? 1 : 0;
+  return { n: (disk ? 2 : 0) + (bad ? 3 : 0) + (db ? 1 : 0) + (drill ? 3 : 0) + (dataLoss ? 4 : 0) + overload + stale + backedUp, disk, bad, db, drill, dataLoss };
 }
 
 /** Can the load balancer survive losing web-01 right now? */
@@ -288,7 +294,15 @@ export function diskUsagePct(world: World): number {
 }
 
 export function logGrowthPerMin(world: World): number {
-  return world.company.launched ? 60 : 0.12; // launched apps log a LOT
+  if (!world.company.launched) return 0.12; // launched apps log a LOT
+  // era (P6b): scale stages re-open the logrotate problem at full traffic —
+  // S3 (1M users) emits 100×, S4+ (10M+) emits 1000×
+  if (world.era) {
+    const stage = eraStageOf(world);
+    if (stage >= 4) return 60_000;
+    if (stage >= 3) return 6_000;
+  }
+  return 60;
 }
 
 export function logVolumeMB(world: World): number {
@@ -307,6 +321,7 @@ function tickOne(world: World): void {
   // users & revenue
   if (c.launched) {
     let growthPerMin = (c.users * 0.0042 + 90) * (c.satisfaction / 5) / 1440;
+    if (world.era) growthPerMin *= eraGrowthMultOf(world); // P6d: the era paces like an incremental game
     if (num(world.flags.marketingUntilMin) > world.nowMin) growthPerMin *= 2.5;
     c.users = Math.max(0, c.users + growthPerMin);
     const revenuePerMin = (c.users * 2) / 30 / 1440;
@@ -329,18 +344,35 @@ function tickOne(world: World): void {
   tickK8s(world, req);
   const src = errorSourcesOf(world);
   const running = world.app.mode !== 'stopped';
-  // a provider outage or migration cutover takes the whole footprint down
-  const cloudDown = Boolean(world.cloud?.outage) || world.cloud?.migration?.status === 'cutover';
+  // a provider outage or migration cutover takes the whole footprint down —
+  // unless a secondary region can take the traffic (P6b failover)
+  const outage = world.cloud?.outage;
+  const outageActive = Boolean(outage && outage.endedAtMin === undefined);
+  const secondary = world.cloud?.secondary;
+  const canFailover = Boolean(outageActive && outage && secondary && (secondary.provider !== outage.provider || secondary.region !== outage.region));
+  const cloudDown = (outageActive && !canFailover) || world.cloud?.migration?.status === 'cutover';
+  const failoverGlitch = canFailover && Boolean(outage && world.nowMin - outage.startedAtMin < ERA_ECON.failoverGlitchMin);
   const latAdj = latencyMsOf(world.cloud?.provider, world.cloud?.region) - BASE_LATENCY_MS;
-  // two healthy backends share the load
+  const failoverLatAdj = canFailover && secondary ? latencyMsOf(secondary.provider, secondary.region) - BASE_LATENCY_MS : 0;
+  // two healthy backends share the load; the CDN keeps hits away from the origin
+  const serveReq = originReqRateAt(world);
   const haScale = haReady(world) ? 0.55 : 1;
-  const cpu = running && !cloudDown ? Math.min(98, (6 + req * 0.5 + (src.bad ? 9 : 0) + (world.flags.trafficSpike ? 14 : 0)) * haScale) : 0;
-  updateDbCpu(world, req);
-  const errorPct = running ? (cloudDown ? 80 : Math.min(80, 0.08 + src.n * 6 + (cpu > 95 ? 1.5 : 0))) : 0;
+  const cpu = running && !cloudDown ? Math.min(98, (6 + serveReq * 0.5 + (src.bad ? 9 : 0) + (world.flags.trafficSpike ? 14 : 0)) * haScale) : 0;
+  updateDbCpu(world, dbQpsOf(world));
+  // era (P6a): 70–100% of fleet capacity bends latency, same shape as the DB's cpu curve
+  const utilPct = world.era ? computeUtilOf(world) * 100 : 0;
+  const utilLatency = utilPct > 70 ? (utilPct - 70) * 2.1 : 0;
+  const errorPct = running
+    ? cloudDown ? 80
+      : failoverGlitch ? 15
+        : Math.min(80, 0.08 + src.n * 6 + (cpu > 95 ? 1.5 : 0))
+    : 0;
   const p95 = running
     ? cloudDown
       ? 3000 + latAdj
-      : Math.round(38 + latAdj + cpu * 1.6 + world.db.cpuPct * 2.1 + (src.bad ? 2400 : 0) + (src.disk ? 700 : 0) + (cpu > 95 ? 900 : 0))
+      : failoverGlitch
+        ? 800 + latAdj
+        : Math.round(38 + latAdj + failoverLatAdj + cpu * 1.6 + world.db.cpuPct * 2.1 + utilLatency + (src.bad ? 2400 : 0) + (src.disk ? 700 : 0) + (cpu > 95 ? 900 : 0))
     : 0;
   pushPoint(world, 'req_rate', req);
   pushPoint(world, 'error_pct', errorPct);
@@ -350,6 +382,37 @@ function tickOne(world: World): void {
   pushPoint(world, 'db_cpu_pct', world.db.provisioned ? world.db.cpuPct : 0);
   pushPoint(world, 'disk_pct', diskUsagePct(world));
   pushPoint(world, 'users', Math.round(c.users));
+  if (world.db.replica) pushPoint(world, 'replica_lag_ms', replicaLagMsOf(world));
+  if (world.queue) pushPoint(world, 'queue_backlog', world.queue.backlog);
+
+  // era (P6b): stage watermark, queue drain, cache stampedes, composite crises
+  if (world.era) {
+    const stage = eraStageOf(world);
+    if (stage > (world.era.stageReached ?? 0)) {
+      world.era.stageReached = stage;
+      if (STAGE_COPY[stage]) audit(world, 'system', 'era', STAGE_COPY[stage]);
+    }
+    if (world.queue) {
+      const jobsPerMin = serveReq * writeShareOf(world) * 60;
+      const drainPerMin = world.queue.workers * ERA_ECON.workerDrainPerS * 60;
+      world.queue.backlog = Math.min(1e7, Math.max(0, world.queue.backlog + jobsPerMin - drainPerMin));
+    }
+    const cdn = world.cdn;
+    const inStampede = Boolean(cdn?.stampedeUntilMin && world.nowMin < cdn.stampedeUntilMin);
+    if (cdn && !inStampede && eraStageOf(world) >= 2 && Math.random() < ERA_ECON.stampedeChancePerMin) startStampede(world);
+    if (stage >= 5 && Math.random() < ERA_ECON.crisisChancePerMin) {
+      // composite crisis: spike + stampede + an outage inbound — everything, at once
+      world.flags.trafficSpike = true;
+      world.scheduledEvents.push({ atMin: world.nowMin + 1440, kind: 'era_spike_off' });
+      if (cdn && !cdn.stampedeUntilMin) startStampede(world);
+      world.scheduledEvents.push({ atMin: world.nowMin + 2, kind: 'provider_outage' });
+      audit(world, 'chaos', 'era', 'COMPOSITE CRISIS: traffic spike + cache stampede, and a provider outage is minutes out. Everything, at once.');
+    }
+    tickEraOnCall(world);
+    tickEraIdeas(world);
+    tickEraRivals(world);
+    if (world.nowMin % 1440 === 0) checkEraBadges(world);
+  }
 
   // uptime window (30d approximation)
   if (errorPct > 5) world.flags.uptimeBadMin = num(world.flags.uptimeBadMin) + 1;
@@ -432,14 +495,20 @@ function tickOne(world: World): void {
       audit(world, 'system', 'event', 'Campaign traffic returned to normal levels');
     }
     if (e.kind === 'marketing_end') audit(world, 'system', 'marketing', 'Marketing campaign finished — growth back to organic');
-    if (e.kind === 'ambient_incident') openAmbientIncident(world);
+    if (e.kind === 'ambient_incident') openAmbientIncident(world, Boolean(world.tournament && !world.tournament.finished));
+    // ^ during a live tournament every such event is a STAGED round — it must open even over a stale incident
     if (e.kind === 'provider_outage') {
-      if (world.cloud?.outage) {
+      const o = world.cloud?.outage;
+      if (o && o.endedAtMin === undefined) {
         // one at a time — try again shortly so the armed outage still lands
         world.scheduledEvents.push({ atMin: world.nowMin + 120, kind: 'provider_outage' });
       } else if (world.cloud) {
         openProviderOutage(world);
       }
+    }
+    if (e.kind === 'era_spike_off') {
+      world.flags.trafficSpike = false;
+      audit(world, 'system', 'era', 'The crisis traffic spike subsides');
     }
     if (e.kind === 'new_customer') audit(world, 'system', 'sales', 'New enterprise customer signed — revenue up');
     if (e.kind === 'ha_drill') {
@@ -534,8 +603,10 @@ function tickOne(world: World): void {
       }
     }
   }
-  // ambient events after the build phase — more likely the deeper the debt
-  if (world.flags.buildPhaseComplete && Math.random() < ambientIncidentChance(world)) {
+  // ambient events after the build phase — more likely the deeper the debt.
+  // The postmortem tournament runs in a controlled environment: no ambient
+  // chaos during a live competition, it would poison the scored MTTR windows.
+  if (world.flags.buildPhaseComplete && !(world.tournament && !world.tournament.finished) && Math.random() < ambientIncidentChance(world)) {
     const roll = Math.random();
     if (roll < 0.35) world.scheduledEvents.push({ atMin: world.nowMin + 5, kind: 'ambient_incident' });
     else if (roll < 0.7) world.scheduledEvents.push({ atMin: world.nowMin + 30, kind: 'traffic_spike' });
@@ -711,6 +782,367 @@ export function resolveIncident(world: World, inc: Incident, note: string): void
   world.company.satisfaction = Math.min(5, world.company.satisfaction + 0.15);
   audit(world, 'system', 'incident', `INCIDENT RESOLVED: ${inc.title} — ${note}`);
   inc.timeline.push({ t: world.nowMin, actor: 'system', text: note });
+  // era (P6c): incidents cost cash directly — refunds & SLA credits scale with users
+  if (world.era) {
+    const minutes = Math.max(10, world.nowMin - inc.openedAtMin);
+    const perHour = inc.severity === 'SEV1' ? ERA_ECON.sevRefundPerUserHour : ERA_ECON.sev2RefundPerUserHour;
+    const cost = Math.round(world.company.users * perHour * (minutes / 60));
+    if (cost > 0) {
+      world.company.cash -= cost;
+      world.era.incidentCashPaid = (world.era.incidentCashPaid ?? 0) + cost;
+      audit(world, 'finance', 'era', `INCIDENT LEDGER: $${cost.toLocaleString()} in refunds & SLA credits for "${inc.title}" (${minutes} min at ${Math.round(world.company.users).toLocaleString()} users). At scale, reliability is a line item.`);
+    }
+  }
+}
+
+// ------------------------------------------------------------------
+// Scale Era (P6c): consequences of being big — the on-call load is an
+// engineer-minutes economy; pages scale with fleet + incidents + debt,
+// automation buys minutes back, and understaffed teams burn out.
+// ------------------------------------------------------------------
+
+/** Automation discount on page/toil demand: portal, golden paths, SLOs. */
+function automationDiscountOf(world: World): number {
+  let d = 1;
+  if (world.portal?.enabled) d *= 0.75;
+  const paths = (world.portal?.templates ?? []).filter((t) => t.published).length;
+  d *= Math.pow(0.97, paths);
+  if (world.slos?.configured) d *= 0.9;
+  return Math.max(0.3, d);
+}
+
+/** The on-call load view: engineer-minutes/day demanded vs supplied. */
+export function oncallLoadOf(world: World): { demandMin: number; supplyMin: number; discountPct: number; ratioPct: number; overloaded: boolean; fleetUnits: number; openIncidents: number } {
+  const fleetUnits = Math.round(computeCapacityOf(world) / ERA_ECON.nodeCapacityReqS);
+  const openIncidents = world.monitoring.incidents.filter((i) => i.status === 'open').length;
+  const raw = fleetUnits * ERA_ECON.fleetMinutesPerPage
+    + openIncidents * ERA_ECON.incidentMinutes
+    + num(world.debt?.points) * ERA_ECON.debtMinutesPerPoint;
+  const discount = automationDiscountOf(world);
+  const demandMin = Math.round(raw * discount);
+  const supplyMin = (world.team?.engineers ?? []).reduce((a, e) => a + (ERA_ECON.roleMinutes[e.role] ?? 480), 0);
+  return {
+    demandMin,
+    supplyMin,
+    discountPct: Math.round(discount * 100),
+    ratioPct: supplyMin > 0 ? Math.round((demandMin / supplyMin) * 100) : demandMin > 0 ? 999 : 0,
+    overloaded: demandMin > supplyMin,
+    fleetUnits,
+    openIncidents
+  };
+}
+
+/** Daily-era on-call economy: burnout accrues when pages outpace the team; 100% burns an engineer out. */
+function tickEraOnCall(world: World): void {
+  const load = oncallLoadOf(world);
+  const team = ensureTeam(world);
+  if (!team.engineers.length) return;
+  const perDayOver = load.overloaded ? (load.demandMin / Math.max(1, load.supplyMin) - 1) * ERA_ECON.burnoutPerDayAtDouble : 0;
+  if (load.overloaded && world.era!.overloadSinceMin === undefined) {
+    world.era!.overloadSinceMin = world.nowMin;
+    audit(world, 'system', 'era', `ON-CALL OVERLOAD: ${load.demandMin} engineer-minutes/day of pages & toil against ${load.supplyMin} of capacity. Burnout is accruing — hire, automate (portal, golden paths, SLOs), or lose people.`);
+  }
+  if (!load.overloaded) world.era!.overloadSinceMin = undefined;
+  if (load.overloaded) world.company.satisfaction = Math.max(0, world.company.satisfaction - 0.02 / 1440);
+  for (const e of team.engineers) {
+    if (perDayOver > 0) {
+      const mult = e.id === team.onCallId ? ERA_ECON.oncallBurnoutMult : 1;
+      e.burnout = Math.min(100, (e.burnout ?? 0) + (perDayOver * mult) / 1440);
+    } else {
+      e.burnout = Math.max(0, (e.burnout ?? 0) - ERA_ECON.burnoutRecoveryPerDay / 1440);
+    }
+    if ((e.burnout ?? 0) >= 100) {
+      team.engineers = team.engineers.filter((x) => x.id !== e.id);
+      if (team.onCallId === e.id) team.onCallId = null;
+      world.company.satisfaction = Math.max(0, world.company.satisfaction - 0.3);
+      audit(world, 'system', 'era', `BURNOUT: ${e.name} (${ROLE_INFO[e.role]?.label ?? e.role}) has resigned — the pager won. Hire before the next stage, or automate the toil away.`);
+    }
+  }
+}
+
+/** Era coordination tax: big teams without a developer portal ship more regressions. */
+export function coordinationTaxRoll(world: World): boolean {
+  const engineers = world.team?.engineers.length ?? 0;
+  if (!world.era || engineers <= 6 || world.portal || world.flags.nextDeployHasBug) return false;
+  if (Math.random() >= 0.15 * (engineers / 6)) return false;
+  world.flags.nextDeployHasBug = true;
+  if (!world.era.coordinationWarned) {
+    world.era.coordinationWarned = true;
+    audit(world, 'system', 'era', 'COORDINATION TAX: beyond ~6 engineers without a developer portal, every deploy ships more regressions — the odds scale with headcount. Golden paths are the fix (PORTAL tab).');
+  }
+  return true;
+}
+
+// ------------------------------------------------------------------
+// Scale Era (P6d): era mode pacing — stage-scaled growth, a crank-the-
+// clock control, the R&D money sink, and a product pipeline that lives
+// (ramp → mature → decay → refresh releases).
+// ------------------------------------------------------------------
+
+/** Era growth multiplier: stage-scaled, plus 8% per R&D level. */
+export function eraGrowthMultOf(world: World): number {
+  if (!world.era) return 1;
+  const rd = world.era.rdLevel ?? 0;
+  return (ERA_ECON.growthMultBase + eraStageOf(world) * ERA_ECON.growthMultPerStage) * (1 + rd * ERA_ECON.rdBonusPerLevel);
+}
+
+/** Users needed for the next scale stage (null at S5 — there is no next). */
+export function nextStageUsersOf(world: World): number | null {
+  const u = world.company.users;
+  for (const t of [10e3, 100e3, 1e6, 10e6, 100e6]) if (u < t) return t;
+  return null;
+}
+
+/** The board fast-forwards one sim day — crank the clock, then handle what broke. */
+export function crankDay(world: World): { ok: boolean; message: string } {
+  if (!world.era) return { ok: false, message: 'the clock cranks in the Scale Era' };
+  tick(world, 1440);
+  audit(world, 'board', 'era', `The board fast-forwards a day: day ${Math.floor(world.nowMin / 1440)} — ${Math.round(world.company.users).toLocaleString()} users at stage ${eraStageOf(world)}.`);
+  return { ok: true, message: `advanced one sim day — ${Math.round(world.company.users).toLocaleString()} users, stage ${eraStageOf(world)}` };
+}
+
+/** The money sink: R&D levels trade cash for permanent growth. */
+export function investRd(world: World): { ok: boolean; message: string } {
+  if (!world.era) return { ok: false, message: 'R&D opens with the Scale Era' };
+  const level = world.era.rdLevel ?? 0;
+  if (level >= ERA_ECON.rdMaxLevel) return { ok: false, message: 'R&D is maxed at level 5' };
+  const cost = ERA_ECON.rdCostPerLevel * (level + 1);
+  if (world.company.cash < cost) return { ok: false, message: `R&D level ${level + 1} costs $${cost.toLocaleString()} — you have $${Math.round(world.company.cash).toLocaleString()}` };
+  world.company.cash -= cost;
+  world.era.rdLevel = level + 1;
+  audit(world, world.session.user, 'era', `R&D level ${level + 1}: $${cost.toLocaleString()} invested — growth +${Math.round(ERA_ECON.rdBonusPerLevel * (level + 1) * 100)}% forever. Rich stays meaningful: cash becomes compounding.`);
+  return { ok: true, message: `R&D at level ${level + 1} — growth +${Math.round(ERA_ECON.rdBonusPerLevel * (level + 1) * 100)}%` };
+}
+
+export function refreshCostOf(p: Product): number {
+  const gen = p.lifecycle?.generation ?? 1;
+  return ERA_ECON.refreshBaseCost + ERA_ECON.refreshCostPerGeneration * (gen - 1);
+}
+
+/** A refresh release: resets decay, raises the ceiling, keeps "ship infinitely" true. */
+export function refreshProduct(world: World, productId: string): { ok: boolean; message: string } {
+  if (!world.era) return { ok: false, message: 'refresh releases open with the Scale Era' };
+  const p = ensureProducts(world).products.find((x) => x.id === productId);
+  if (!p || p.launchedAtMin === undefined) return { ok: false, message: 'only launched products can ship a refresh' };
+  const gen = p.lifecycle?.generation ?? 1;
+  const cost = refreshCostOf(p);
+  if (world.company.cash < cost) return { ok: false, message: `v${gen + 1} costs $${cost.toLocaleString()} — you have $${Math.round(world.company.cash).toLocaleString()}` };
+  world.company.cash -= cost;
+  const peak = (p.lifecycle?.peakAdoptionPct ?? p.adoptionPct) * 1.15;
+  p.lifecycle = { peakAdoptionPct: peak, matureAtMin: world.nowMin + ERA_ECON.matureDays * 1440, generation: gen + 1 };
+  audit(world, world.session.user, 'product', `${p.name} v${gen + 1} shipped ($${cost.toLocaleString()}) — adoption ramps toward ${peak.toFixed(1)}% of users and the decay clock resets. Ship infinitely.`);
+  return { ok: true, message: `${p.name} v${gen + 1} shipped — adoption ramping again` };
+}
+
+/** Era product ideas accrue in the backlog — the catalog is never finished. */
+const ERA_IDEAS: Omit<Product, 'startedAtMin' | 'launchedAtMin'>[] = [
+  { id: 'era-beacon', name: 'Beacon', tagline: 'hosted status pages so customers hear it from you first', tier: 'addon', pricePerUserMonthly: 0.3, adoptionPct: 18, infraMonthly: 15, buildCost: 1000, buildDurationMin: 300 },
+  { id: 'era-relay', name: 'Relay', tagline: 'private networking between customers and your stack', tier: 'growth', pricePerUserMonthly: 1.0, adoptionPct: 10, infraMonthly: 55, buildCost: 2200, buildDurationMin: 420 },
+  { id: 'era-ledgerline', name: 'Ledgerline', tagline: 'usage billing that meters what the platform already counts', tier: 'growth', pricePerUserMonthly: 1.4, adoptionPct: 12, infraMonthly: 40, buildCost: 2400, buildDurationMin: 460 },
+  { id: 'era-pulse', name: 'Pulse', tagline: 'synthetic monitoring from the customer’s side of the internet', tier: 'addon', pricePerUserMonthly: 0.5, adoptionPct: 22, infraMonthly: 30, buildCost: 1500, buildDurationMin: 340 },
+  { id: 'era-forge', name: 'Forge', tagline: 'managed CI runners on the same fleet that serves traffic', tier: 'growth', pricePerUserMonthly: 1.2, adoptionPct: 14, infraMonthly: 60, buildCost: 2600, buildDurationMin: 480 },
+  { id: 'era-atlas', name: 'Atlas', tagline: 'a service catalog that maps every deploy to every owner', tier: 'addon', pricePerUserMonthly: 0.4, adoptionPct: 20, infraMonthly: 20, buildCost: 1200, buildDurationMin: 320 },
+  { id: 'era-quill', name: 'Quill', tagline: 'postmortems that write their first draft from the audit feed', tier: 'addon', pricePerUserMonthly: 0.35, adoptionPct: 16, infraMonthly: 12, buildCost: 900, buildDurationMin: 280 }
+];
+
+function tickEraIdeas(world: World): void {
+  const era = world.era!;
+  if (era.nextIdeaAtMin === undefined) era.nextIdeaAtMin = world.nowMin + ERA_ECON.ideaEveryDays * 1440;
+  if (world.nowMin < era.nextIdeaAtMin) return;
+  era.nextIdeaAtMin = world.nowMin + ERA_ECON.ideaEveryDays * 1440;
+  const products = ensureProducts(world).products;
+  if (products.length >= ERA_ECON.productCap) return;
+  const idea = ERA_IDEAS.find((i) => !products.some((p) => p.id === i.id));
+  if (!idea) return;
+  products.push({ ...idea });
+  era.ideasAdded = (era.ideasAdded ?? 0) + 1;
+  audit(world, 'system', 'product', `NEW IDEA in the backlog: ${idea.name} — ${idea.tagline} ($${idea.buildCost.toLocaleString()}, ${idea.pricePerUserMonthly}/user/mo)`);
+}
+
+// ------------------------------------------------------------------
+// Scale Era (P6e): the race. Three rival archetypes grow, outage and
+// publish postmortems on the same tick; two boards and one index make
+// robustness literally worth money; milestones mark the way; share
+// codes make runs comparable without a server.
+// ------------------------------------------------------------------
+
+const ERA_RIVAL_ARCHETYPES: Record<EraRival['archetype'], { name: string; seedMult: number; growthPerDay: number; outagePerDay: number; outageMin: number; robustBase: number; marginPct: number; poach: number }> = {
+  goliath: { name: 'Goliath Cloud', seedMult: 1.25, growthPerDay: 0.09, outagePerDay: 0.02, outageMin: 60, robustBase: 90, marginPct: 42, poach: 0.6 },
+  lean: { name: 'Leanframe', seedMult: 0.75, growthPerDay: 0.05, outagePerDay: 0.12, outageMin: 180, robustBase: 74, marginPct: 86, poach: 1.0 },
+  steady: { name: 'Steady Systems', seedMult: 1.0, growthPerDay: 0.03, outagePerDay: 0.008, outageMin: 40, robustBase: 96, marginPct: 71, poach: 0.3 }
+};
+
+function seedRivals(world: World): void {
+  const era = world.era!;
+  if (era.rivals) return;
+  const users = world.company.users;
+  era.rivals = (Object.keys(ERA_RIVAL_ARCHETYPES) as EraRival['archetype'][]).map((a) => ({
+    id: `rival-${a}`,
+    name: ERA_RIVAL_ARCHETYPES[a].name,
+    archetype: a,
+    users: Math.max(5_000, Math.round(users * ERA_RIVAL_ARCHETYPES[a].seedMult)),
+    badMin: 0,
+    outages: 0,
+    postmortems: 0
+  }));
+  audit(world, 'board', 'era', 'THE RACE: three companies are running the same market — Goliath Cloud buys scale with money, Leanframe runs lean and fragile, Steady Systems is boring and reliable. Wealth and robustness both count.');
+}
+
+function tickEraRivals(world: World): void {
+  const era = world.era!;
+  seedRivals(world);
+  const faltering = (latest(world, 'error_pct') ?? 0) > 5;
+  if (faltering && era.poachSinceMin === undefined) {
+    era.poachSinceMin = world.nowMin;
+    audit(world, 'system', 'era', 'YOUR USERS ARE SHOPPING AROUND: with the error rate up, every rival is running welcome campaigns. Robustness is customer retention.');
+  }
+  if (!faltering) era.poachSinceMin = undefined;
+  for (const r of era.rivals ?? []) {
+    const a = ERA_RIVAL_ARCHETYPES[r.archetype];
+    if (r.outagedUntilMin !== undefined && world.nowMin >= r.outagedUntilMin) {
+      r.outagedUntilMin = undefined;
+      r.postmortems += 1;
+      audit(world, r.name, 'era', `${r.name} published a postmortem: "${r.archetype === 'lean' ? 'we optimized away the redundancy' : r.archetype === 'goliath' ? 'scale-out exceeded the fault domain' : 'a routine change had an un-routine failure'}" (outage #${r.outages})`);
+      continue; // the lights just came back on — no new outage roll this minute
+    }
+    if (r.outagedUntilMin !== undefined) {
+      r.badMin += 1;
+      continue;
+    }
+    r.badMin = Math.max(0, r.badMin - 1 / 240);
+    let growth = a.growthPerDay / 1440;
+    if (faltering) growth += (0.001 * a.poach) / 1440; // rivals poach a slice of your users while you wobble
+    r.users = Math.round(r.users * (1 + growth));
+    if (Math.random() < a.outagePerDay / 1440) {
+      r.outagedUntilMin = world.nowMin + a.outageMin;
+      r.outages += 1;
+    }
+  }
+}
+
+/** Robustness Rating (0–100): availability, error budget, MTTR, days since Sev-1, blast-radius containment. */
+export function robustnessOf(world: World): number {
+  const avail = uptimePct(world);
+  const availScore = Math.max(0, Math.min(1, (avail - 99) / 0.99)) * 30;
+  let budgetScore = 8; // no SLOs written: neutral, not zero
+  if (world.slos?.configured) {
+    const report = sloReport(world);
+    budgetScore = Math.max(0, Math.min(1, report.budgetRemainingPct / 100)) * 20;
+  }
+  const resolved = world.monitoring.incidents.filter((i) => i.resolvedAtMin !== undefined).slice(-5);
+  let mttrScore = 20;
+  if (resolved.length) {
+    const mttr = resolved.reduce((a, i) => a + (i.resolvedAtMin! - i.openedAtMin), 0) / resolved.length;
+    mttrScore = Math.max(0, Math.min(1, 1 - mttr / 480)) * 20; // 8h mean time to resolve → 0
+  }
+  let sevScore = 15;
+  const sev1s = world.monitoring.incidents.filter((i) => i.severity === 'SEV1');
+  if (sev1s.length) {
+    const last = Math.max(...sev1s.map((i) => i.openedAtMin));
+    sevScore = Math.min(15, ((world.nowMin - last) / 1440) * 1.5); // 10 clean days → full marks
+  }
+  let contain = 0;
+  if (haReady(world)) contain += 8;
+  if (world.k8s?.zeroDowntimeProven) contain += 4;
+  if (world.db.backups.enabled) contain += 3;
+  return Math.round(availScore + budgetScore + mttrScore + sevScore + contain);
+}
+
+/** Live valuation: annual MRR × a robustness-and-growth multiple (the m40 term sheet, but every day). */
+export function valuationOf(world: World): { mrr: number; robustness: number; multiple: number; valuation: number; netWorth: number } {
+  const mrr = baseMrrOf(world) + productMrrOf(world);
+  const robustness = robustnessOf(world);
+  const growthBonus = Math.min(1.5, eraGrowthMultOf(world) / 20);
+  const multiple = 3 + (robustness / 100) * 5 + growthBonus;
+  const valuation = Math.round(mrr * 12 * multiple);
+  return { mrr: Math.round(mrr), robustness, multiple: Math.round(multiple * 10) / 10, valuation, netWorth: Math.round(world.company.cash + valuation) };
+}
+
+export interface RaceRow {
+  id: string;
+  name: string;
+  you: boolean;
+  archetype: string;
+  users: number;
+  mrr: number;
+  marginPct: number;
+  robustness: number;
+  valuation: number;
+  index: number;
+}
+
+/** The Ship It Index: robustness-weighted worth — one comparable number where robust systems literally rank richer. */
+export function raceBoardOf(world: World): { rows: RaceRow[]; playerRank: number; gapToNext: number | null } {
+  seedRivals(world);
+  const v = valuationOf(world);
+  const infra = monthlyInfraCost(world);
+  const mrr = v.mrr;
+  const rows: RaceRow[] = [
+    {
+      id: 'you', name: `${world.company.name} (you)`, you: true, archetype: 'yours',
+      users: Math.round(world.company.users), mrr,
+      marginPct: mrr > 0 ? Math.max(0, Math.round(((mrr - infra) / mrr) * 100)) : 0,
+      robustness: v.robustness, valuation: v.valuation,
+      index: Math.round(v.valuation * (v.robustness / 100))
+    },
+    ...(world.era?.rivals ?? []).map((r): RaceRow => {
+      const a = ERA_RIVAL_ARCHETYPES[r.archetype];
+      const avail = 100 - (r.badMin / 43200) * 100;
+      const robust = Math.max(10, Math.round(a.robustBase * (avail / 100)));
+      const mrrR = Math.round(r.users * 2);
+      const val = Math.round(mrrR * 12 * (3 + (robust / 100) * 5));
+      return { id: r.id, name: r.name, you: false, archetype: r.archetype, users: Math.round(r.users), mrr: mrrR, marginPct: a.marginPct, robustness: robust, valuation: val, index: Math.round(val * (robust / 100)) };
+    })
+  ].sort((x, y) => y.index - x.index);
+  const playerRank = rows.findIndex((r) => r.you) + 1;
+  const gapToNext = playerRank > 1 ? rows[playerRank - 2].index - rows[playerRank - 1].index : null;
+  return { rows, playerRank, gapToNext };
+}
+
+function grantEraBadge(world: World, id: string, label: string): void {
+  const era = world.era!;
+  era.badges ??= [];
+  if (era.badges.includes(id)) return;
+  era.badges.push(id);
+  audit(world, 'board', 'era', `MILESTONE: ${label}`);
+}
+
+/** Daily milestone check — short-term competitive targets on the road through the stages. */
+function checkEraBadges(world: World): void {
+  const mrr = baseMrrOf(world) + productMrrOf(world);
+  if (mrr >= 1e6) grantEraBadge(world, 'mrr-1m', '$1M MRR club');
+  if (world.company.users >= 1e6 && uptimePct(world) >= 99.99) grantEraBadge(world, 'uptime-1m', '99.99% held at 1M users');
+  if (world.company.users >= 10e6 && mrr > 0 && monthlyInfraCost(world) / mrr <= 0.25) grantEraBadge(world, 'margin-10m', 'margin ≤25% held at 10M users');
+  if (eraStageOf(world) >= 5) grantEraBadge(world, 'summit', '100M users — the summit of the Scale Era');
+}
+
+/** Run summary as a compact deterministic share code: base36 stats + checksum, decodable offline. */
+export function shareCodeOf(world: World): { code: string; summary: { day: number; stage: number; users: number; mrr: number; robustness: number; cash: number; badges: number; rd: number } } {
+  const era = world.era;
+  const summary = {
+    day: Math.floor((world.nowMin - (era?.startedAtMin ?? 0)) / 1440),
+    stage: eraStageOf(world),
+    users: Math.round(world.company.users),
+    mrr: Math.round(baseMrrOf(world) + productMrrOf(world)),
+    robustness: robustnessOf(world),
+    cash: Math.max(0, Math.round(world.company.cash)),
+    badges: (era?.badges ?? []).length,
+    rd: era?.rdLevel ?? 0
+  };
+  const enc = [summary.day, summary.stage, summary.users, summary.mrr, summary.robustness, summary.cash, summary.badges, summary.rd].map((n) => Math.max(0, Math.round(n)).toString(36)).join('-');
+  const hash = hashStr(enc).slice(0, 4).toUpperCase();
+  return { code: `SI-${enc}-${hash}`, summary };
+}
+
+export function parseShareCode(code: string): { ok: boolean; summary?: ReturnType<typeof shareCodeOf>['summary']; reason?: string } {
+  const m = /^SI-([0-9a-z-]+)-([0-9A-F]{4})$/i.exec(code.trim());
+  if (!m) return { ok: false, reason: 'not a Ship It share code (expected SI-…-…)' };
+  const [, enc, hash] = m;
+  if (hashStr(enc).slice(0, 4).toUpperCase() !== hash.toUpperCase()) return { ok: false, reason: 'checksum mismatch — code was mistyped' };
+  const raw = enc.split('-');
+  if (raw.length !== 8) return { ok: false, reason: 'truncated code' };
+  const [day, stage, users, mrr, robustness, cash, badges, rd] = raw.map((x) => parseInt(x, 36));
+  return { ok: true, summary: { day, stage, users, mrr, robustness, cash, badges, rd } };
 }
 
 /** Page the on-call engineer (if any) when an incident opens; SREs halve the damage. */
@@ -729,8 +1161,10 @@ export function pageOnCall(world: World, inc: Incident): void {
 }
 
 /** A minor, self-recovering incident of the operate phase (traffic surge). */
-export function openAmbientIncident(world: World): void {
-  if (world.monitoring.incidents.some((i) => i.status === 'open')) return;
+export function openAmbientIncident(world: World, force = false): void {
+  // ambient events yield to whatever is already open; STAGED scenario incidents
+  // (tournament rounds) must not be eaten by a stale open incident
+  if (!force && world.monitoring.incidents.some((i) => i.status === 'open')) return;
   const inc: Incident = {
     id: 'inc-ambient-' + Math.floor(world.nowMin % 100000),
     kind: 'traffic_spike',
@@ -923,7 +1357,9 @@ export function metricsView(world: World): { fog: boolean; latest: Record<string
       req_rate: visible('req_rate').slice(-90).map((p) => p.v),
       p95_ms: visible('p95_ms').slice(-90).map((p) => p.v),
       db_cpu_pct: visible('db_cpu_pct').slice(-120).map((p) => p.v),
-      disk_pct: visible('disk_pct').slice(-200).map((p) => p.v)
+      disk_pct: visible('disk_pct').slice(-200).map((p) => p.v),
+      ...(world.db.replica ? { replica_lag_ms: visible('replica_lag_ms').slice(-120).map((p) => p.v) } : {}),
+      ...(world.queue ? { queue_backlog: visible('queue_backlog').slice(-120).map((p) => p.v) } : {})
     }
   };
 }
@@ -1049,7 +1485,8 @@ export function addAlertRule(world: World, metric: string, op: AlertRule['op'], 
   }
   const labels: Record<string, string> = {
     error_pct: 'Error rate', cpu_pct: 'CPU', db_cpu_pct: 'Database CPU', p95_ms: 'P95 latency',
-    disk_pct: 'Disk usage', mem_pct: 'Memory', req_rate: 'Request rate'
+    disk_pct: 'Disk usage', mem_pct: 'Memory', req_rate: 'Request rate',
+    replica_lag_ms: 'Replica lag', queue_backlog: 'Queue backlog'
   };
   const rule: AlertRule = {
     id: 'alert-' + Math.random().toString(16).slice(2, 8),
@@ -1085,7 +1522,8 @@ export function hireEngineer(world: World, role: EngineerRole): { ok: boolean; m
   const team = ensureTeam(world);
   const info = ROLE_INFO[role];
   if (!info) return { ok: false, message: `unknown role "${role}"` };
-  if (team.engineers.length >= 6) return { ok: false, message: 'the office only fits six engineers' };
+  const cap = world.era ? 40 : 6; // the Scale Era pays for a bigger office — scale needs a real team
+  if (team.engineers.length >= cap) return { ok: false, message: world.era ? 'hiring freeze — even the era has a cap' : 'the office only fits six engineers' };
   const taken = new Set(team.engineers.map((e) => e.name));
   const name = ENGINEER_NAMES.find((n) => !taken.has(n)) ?? ('Eng-' + (team.engineers.length + 1));
   const eng: Engineer = { id: 'eng-' + hashStr(name + role).slice(0, 6), name, role, salaryMonthly: info.salary, hiredAtMin: world.nowMin };
@@ -1313,7 +1751,276 @@ function baseCostItems(world: World): BaseItem[] {
     if (p.launchedAtMin !== undefined) items.push({ category: 'Products', label: `${p.name} (infra)`, monthlyCost: p.infraMonthly, cloud: true });
   }
   if (world.monitoring.agentInstalled) items.push({ category: 'Monitoring', label: 'Observability agent + 5 GB metrics', monthlyCost: 25, cloud: false });
+  if (world.era) items.push(...eraCostItems(world));
   return items;
+}
+
+// ------------------------------------------------------------------
+// Scale Era (P6a): honest economy — load-coupled billing + compute
+// utilization. Everything here is gated on `world.era` (set when the
+// m40 term sheet is accepted) so mid-campaign balance is untouched.
+// ------------------------------------------------------------------
+
+/** All money constants live here; the P6 tuning-gate test asserts the curve they produce. */
+const ERA_ECON = {
+  reqsIncludedMonthly: 2e9,    // Growth plan: first 2B requests/mo included
+  reqPricePerM: 20,            // $ per 1M billed requests (L7, list)
+  egressKBPerReq: 8,           // avg response size
+  egressPricePerGB: 0.12,
+  logPricePerGB: 1.2,          // ingestion + retention on what the app emits
+  objPricePerGB: 0.03,         // object storage (db backups held)
+  dbSurchargePerPct: 0.015,    // +1.5% of plan price per db-CPU point above 70
+  dbSurchargeFreePct: 70,
+  secsPerMonth: 2_592_000,     // 30 days
+  minsPerMonth: 43_200,
+  nodeCapacityReqS: 200,       // req/s one m3.medium (VM or k8s node) serves before saturating
+  // --- P6b levers ---
+  cdnHitPct: { basic: 60, pro: 85 },
+  cdnFlat: { basic: 150, pro: 400 },
+  cdnPricePerGB: { basic: 0.05, pro: 0.04 },
+  workerPrice: 35,             // $/mo per async worker
+  workerDrainPerS: 40,         // jobs/s one worker drains
+  replicaReadShare: 0.6,       // share of READS a replica takes off the primary
+  lagMsPerPctOver: 20,         // replication lag per replica-CPU point above 70
+  staleReadLagMs: 250,         // past this, users see stale data (error term)
+  failoverGlitchMin: 3,        // DNS cutover window after a region dies
+  secondaryDuplication: 0.5,   // standby region = half the footprint (total ×1.5)
+  stampedeChancePerMin: 0.0002,// S2+: cache revalidation storm
+  stampedeMin: 30,
+  crisisChancePerMin: 0.0001,  // S5: composite crises
+  // --- P6c consequences ---
+  sevRefundPerUserHour: 0.03,  // Sev-1 refunds, $ per user per incident-hour
+  sev2RefundPerUserHour: 0.01,
+  fleetMinutesPerPage: 15,     // engineer-minutes/day the fleet generates in pages & toil
+  incidentMinutes: 90,         // engineer-minutes/day per open incident
+  debtMinutesPerPoint: 8,      // engineer-minutes/day per debt point
+  roleMinutes: { junior: 240, mid: 480, senior: 660, sre: 720 } as Record<string, number>,
+  burnoutPerDayAtDouble: 25,   // burnout/day when pages are 2× the team
+  oncallBurnoutMult: 1.5,      // the pager is heavier
+  burnoutRecoveryPerDay: 10,
+  concentrationMult: 2,        // S3+ single-region: providers fail you twice as often
+  enterprisePosturePenalty: 0.7, // enterprise revenue while compliance findings are open
+  // --- P6d era mode: pacing, product lifecycle, money sinks ---
+  growthMultBase: 6,           // era growth = (base + stage×3) × R&D bonus — 10× in weeks, not years
+  growthMultPerStage: 3,
+  rdMaxLevel: 5,
+  rdCostPerLevel: 50_000,
+  rdBonusPerLevel: 0.08,       // +8% growth per R&D level
+  ideaEveryDays: 10,           // era ideas accrue into the product backlog
+  productCap: 12,
+  lifecycleRampPerDay: 0.04,   // fraction of the gap to peak adoption closed per day
+  lifecycleDecayPerDay: 0.03,  // adoption decay once matured
+  matureDays: 30,
+  refreshBaseCost: 8_000,
+  refreshCostPerGeneration: 4_000
+} as const;
+
+/** Diurnal-average request rate (mean of the 0.55+0.45·sin curve in reqRateAt). */
+export function avgReqRateAt(world: World): number {
+  return world.company.launched ? world.company.users * 0.02 * 0.55 : 0;
+}
+
+/** Requests/month at current scale: avg rate × 2.6M seconds. */
+export function monthlyReqsOf(world: World): number {
+  return avgReqRateAt(world) * ERA_ECON.secsPerMonth;
+}
+
+/** Scale stage from traffic: S1 10k, S2 100k, S3 1M, S4 10M, S5 100M users. */
+export function eraStageOf(world: World): number {
+  const u = world.company.users;
+  return u >= 100e6 ? 5 : u >= 10e6 ? 4 : u >= 1e6 ? 3 : u >= 100e3 ? 2 : u >= 10e3 ? 1 : 0;
+}
+
+const STAGE_COPY: Record<number, string> = {
+  1: 'SCALE STAGE S1 (10k users): reads are heating the database — the pooler helps, a read replica splits reads off the primary.',
+  2: 'SCALE STAGE S2 (100k users): the origin saturates at peak — put a CDN in front, let the autoscaler earn its keep, and watch the bill at peak.',
+  3: 'SCALE STAGE S3 (1M users): write load triples and a single region is one outage away from zero. Queue the writes; stand up a second region. Logs just went 100× — logrotate or drown.',
+  4: 'SCALE STAGE S4 (10M users): hot partitions, 1000× log growth, rollouts across the whole fleet. The database wants sharding — the surcharge is the reminder.',
+  5: 'SCALE STAGE S5 (100M users): everything, at once. Composite crises now arrive on random timers.'
+};
+
+function cdnHitPctOf(world: World): number {
+  const cdn = world.cdn;
+  if (!world.era || !cdn) return 0;
+  const base = ERA_ECON.cdnHitPct[cdn.tier];
+  return cdn.stampedeUntilMin !== undefined && world.nowMin < cdn.stampedeUntilMin ? base * 0.25 : base;
+}
+
+/** Requests that actually reach the origin fleet (CDN offload applies in the era). */
+export function originReqRateAt(world: World): number {
+  return reqRateAt(world) * (1 - cdnHitPctOf(world) / 100);
+}
+
+/** Share of origin requests that are writes (S3+ shifts the mix). */
+export function writeShareOf(world: World): number {
+  return world.era && eraStageOf(world) >= 3 ? 0.35 : 0.2;
+}
+
+/** Query rate the database actually sees: reads (minus replica share) + writes (queue-capped). */
+export function dbQpsOf(world: World): number {
+  if (!world.era) return reqRateAt(world); // campaign: every request hits the db
+  const req = originReqRateAt(world);
+  const w = writeShareOf(world);
+  const drain = world.queue ? world.queue.workers * ERA_ECON.workerDrainPerS : Infinity;
+  const reads = req * (1 - w) * (world.db.replica ? 1 - ERA_ECON.replicaReadShare : 1);
+  return reads + Math.min(req * w, drain);
+}
+
+/** Replication lag in ms: the replica's own cpu curve, taxed past 70%. */
+export function replicaLagMsOf(world: World): number {
+  if (!world.era || !world.db.provisioned || !world.db.replica) return 0;
+  const readQps = originReqRateAt(world) * (1 - writeShareOf(world)) * ERA_ECON.replicaReadShare;
+  const cpu = dbCpuFor(world.db.replica.plan, readQps, indexedDb(world));
+  return Math.max(0, Math.round((cpu - ERA_ECON.dbSurchargeFreePct) * ERA_ECON.lagMsPerPctOver));
+}
+
+/** The index signal the db-cpu curve uses everywhere: the mission fix OR a real index. */
+function indexedDb(world: World): boolean {
+  return Boolean(world.flags.indexFixApplied) || hasStatusIndex(world);
+}
+
+/** Would the standby region take traffic if the primary died right now? */
+export function failoverReadyOf(world: World): boolean {
+  const s = world.cloud?.secondary;
+  return Boolean(world.era && s);
+}
+
+/** Every compute unit you are billed for also serves traffic; an active failover runs on half a fleet. */
+export function computeCapacityOf(world: World): number {
+  let cap = Object.keys(world.hosts).length * ERA_ECON.nodeCapacityReqS;
+  if (world.k8s?.provisioned) cap += world.k8s.nodes.length * ERA_ECON.nodeCapacityReqS;
+  const o = world.cloud?.outage;
+  if (o && o.endedAtMin === undefined && failoverReadyOf(world) && (world.cloud!.secondary!.provider !== o.provider || world.cloud!.secondary!.region !== o.region)) {
+    cap = Math.ceil(cap / 2);
+  }
+  return cap;
+}
+
+/** Era compute utilization (0..∞) for the current origin request rate. */
+export function computeUtilOf(world: World): number {
+  return originReqRateAt(world) / Math.max(1, computeCapacityOf(world));
+}
+
+function dbPlanPrice(plan: string): number {
+  return plan === 'db.micro' ? 45 : plan === 'db.small' ? 120 : 260;
+}
+
+/** The load-coupled line items; zero-cost items are skipped to keep the bill readable.
+ *  Requests and egress bill on ORIGIN-served traffic — CDN hits never touch your bill. */
+function eraCostItems(world: World): BaseItem[] {
+  const items: BaseItem[] = [];
+  const reqs = monthlyReqsOf(world);
+  const hit = cdnHitPctOf(world);
+  const originReqs = reqs * (1 - hit / 100);
+  const billed = Math.max(0, originReqs - ERA_ECON.reqsIncludedMonthly);
+  const reqCost = Math.round((billed / 1e6) * ERA_ECON.reqPricePerM);
+  if (reqCost > 0) {
+    const off = hit > 0 ? ` · ${Math.round(hit)}% offloaded to CDN` : '';
+    items.push({ category: 'Requests', label: `App requests (${fmtB(originReqs)}/mo at origin — first 2B included${off})`, monthlyCost: reqCost, cloud: true });
+  }
+  const egressGB = (originReqs * ERA_ECON.egressKBPerReq) / 1e6;
+  const egressCost = Math.round(egressGB * ERA_ECON.egressPricePerGB);
+  if (egressCost > 0) items.push({ category: 'Egress', label: `Data egress (${Math.round(egressGB).toLocaleString()} GB/mo @ 8 KB/req)`, monthlyCost: egressCost, cloud: true });
+  const cdn = world.cdn;
+  if (cdn) {
+    const cdnGB = (reqs * (hit / 100) * ERA_ECON.egressKBPerReq) / 1e6;
+    const cdnCost = Math.round(ERA_ECON.cdnFlat[cdn.tier] + cdnGB * ERA_ECON.cdnPricePerGB[cdn.tier]);
+    if (cdnCost > 0) items.push({ category: 'Networking', label: `CDN ${cdn.tier} (${Math.round(hit)}% hit ratio, ${Math.round(cdnGB).toLocaleString()} GB served)`, monthlyCost: cdnCost, cloud: true });
+  }
+  const logGB = (logGrowthPerMin(world) * ERA_ECON.minsPerMonth) / 1000;
+  const logCost = Math.round(logGB * ERA_ECON.logPricePerGB);
+  if (logCost > 0) items.push({ category: 'Logging', label: `Log ingestion (${Math.round(logGB).toLocaleString()} GB/mo emitted)`, monthlyCost: logCost, cloud: true });
+  if (world.db.backups.enabled && world.db.backups.snapshots.length) {
+    const rows = world.db.tables['orders']?.rowCount ?? 0;
+    const gb = world.db.backups.snapshots.length * Math.max(1, Math.round(rows / 50_000));
+    const objCost = Math.round(gb * ERA_ECON.objPricePerGB);
+    if (objCost > 0) items.push({ category: 'Storage', label: `Object storage — backup snapshots (${gb} GB held)`, monthlyCost: objCost, cloud: true });
+  }
+  if (world.db.provisioned) {
+    const cpu = dbCpuFor(world.db.plan, dbQpsOfAvg(world), indexedDb(world));
+    const over = Math.max(0, cpu - ERA_ECON.dbSurchargeFreePct);
+    const surcharge = Math.round(dbPlanPrice(world.db.plan) * over * ERA_ECON.dbSurchargePerPct);
+    if (surcharge > 0) items.push({ category: 'Database', label: `Managed DB utilization surcharge (avg CPU ${Math.round(cpu)}% — first 70% included)`, monthlyCost: surcharge, cloud: true });
+    if (world.db.replica) items.push({ category: 'Database', label: `Read replica (${world.db.replica.plan})`, monthlyCost: dbPlanPrice(world.db.replica.plan), cloud: true });
+  }
+  if (world.queue?.workers) items.push({ category: 'Compute', label: `Async workers (${world.queue.workers} × m3.worker)`, monthlyCost: world.queue.workers * ERA_ECON.workerPrice, cloud: true });
+  return items;
+}
+
+/** Average db query rate for billing (same split the tick applies, on the diurnal mean). */
+function dbQpsOfAvg(world: World): number {
+  if (!world.era) return avgReqRateAt(world);
+  const req = avgReqRateAt(world) * (1 - cdnHitPctOf(world) / 100);
+  const w = writeShareOf(world);
+  const drain = world.queue ? world.queue.workers * ERA_ECON.workerDrainPerS : Infinity;
+  const reads = req * (1 - w) * (world.db.replica ? 1 - ERA_ECON.replicaReadShare : 1);
+  return reads + Math.min(req * w, drain);
+}
+
+function fmtB(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(0)}M`;
+  return `${Math.round(n).toLocaleString()}`;
+}
+
+export interface EraBurn {
+  monthlyInfra: number;
+  payroll: number;
+  mrr: number;
+  marginPct: number;
+  hourlyBurn: number;
+  projectedMonthEnd: number;
+  costPerUser: number;
+  revenuePerUser: number;
+  reqsMonthly: number;
+  billedReqsMonthly: number;
+  egressGB: number;
+  logGB: number;
+  capacity: number;
+  utilAvgPct: number;
+  utilPeakPct: number;
+  stage: number;
+  cdnHitPct: number;
+  queueBacklog: number;
+  replicaLagMs: number;
+  failoverReady: boolean;
+}
+
+/** The live burn view behind the COSTS tab's era panel — money as telemetry. */
+export function eraBurnView(world: World): EraBurn {
+  const c = world.company;
+  const infra = monthlyInfraCost(world);
+  const payroll = payrollOf(world);
+  const mrr = baseMrrOf(world) + productMrrOf(world);
+  const users = c.users;
+  const reqs = monthlyReqsOf(world);
+  const cap = computeCapacityOf(world);
+  const originAvg = avgReqRateAt(world) * (1 - cdnHitPctOf(world) / 100);
+  const dayOfMonth = ((world.nowMin / 1440) % 30);
+  const daysLeft = 30 - dayOfMonth;
+  const growthPerDay = users > 0 ? ((users * 0.0042 + 90) * (c.satisfaction / 5)) / users : 0;
+  return {
+    monthlyInfra: Math.round(infra),
+    payroll: Math.round(payroll),
+    mrr: Math.round(mrr),
+    marginPct: mrr > 0 ? Math.round(((mrr - infra - payroll) / mrr) * 100) : 0,
+    hourlyBurn: Math.round(((infra + payroll) / 720) * 100) / 100,
+    projectedMonthEnd: Math.round(infra * (1 + growthPerDay * daysLeft)),
+    costPerUser: users > 0 ? Math.round((infra / users) * 1000) / 1000 : 0,
+    revenuePerUser: users > 0 ? Math.round((mrr / users) * 100) / 100 : 0,
+    reqsMonthly: Math.round(reqs),
+    billedReqsMonthly: Math.round(Math.max(0, reqs * (1 - cdnHitPctOf(world) / 100) - ERA_ECON.reqsIncludedMonthly)),
+    egressGB: Math.round((reqs * (1 - cdnHitPctOf(world) / 100) * ERA_ECON.egressKBPerReq) / 1e6),
+    logGB: Math.round((logGrowthPerMin(world) * ERA_ECON.minsPerMonth) / 1000),
+    capacity: cap,
+    utilAvgPct: Math.round((originAvg / Math.max(1, cap)) * 100),
+    utilPeakPct: Math.round(((c.launched ? users * 0.02 : 0) * (1 - cdnHitPctOf(world) / 100) / Math.max(1, cap)) * 100),
+    stage: eraStageOf(world),
+    cdnHitPct: Math.round(cdnHitPctOf(world)),
+    queueBacklog: Math.round(world.queue?.backlog ?? 0),
+    replicaLagMs: replicaLagMsOf(world),
+    failoverReady: failoverReadyOf(world)
+  };
 }
 
 export function costLineItems(world: World): CostLineItem[] {
@@ -1321,7 +2028,7 @@ export function costLineItems(world: World): CostLineItem[] {
   const mult = cloud ? costMultiplierOf(cloud.provider, cloud.region) : 1;
   // 1-year reserved compute: 20% off compute while you stay on that provider
   const reserved = Boolean(cloud && world.finops?.reservedProvider && world.finops.reservedProvider === cloud.provider);
-  return baseCostItems(world).map((i): CostLineItem => {
+  const items = baseCostItems(world).map((i): CostLineItem => {
     let cost = i.cloud ? Math.round(i.monthlyCost * mult) : i.monthlyCost;
     if (reserved && i.category === 'Compute') cost = Math.round(cost * 0.8);
     return {
@@ -1331,11 +2038,96 @@ export function costLineItems(world: World): CostLineItem[] {
       provider: i.cloud && cloud ? `${cloud.provider}/${cloud.region}` : undefined
     };
   });
+  // era (P6b): a secondary region stands by at half the compute+database footprint —
+  // real failover costs real money. Logging and the edge CDN are global services.
+  if (world.era && cloud?.secondary) {
+    const dup = Math.round(items.filter((i) => i.category === 'Compute' || i.category === 'Database').reduce((a, i) => a + i.monthlyCost, 0) * ERA_ECON.secondaryDuplication);
+    if (dup > 0) items.push({ category: 'Multi-region', label: `Secondary region ${cloud.secondary.region} (standby — half of compute & database)`, monthlyCost: dup, provider: `${cloud.secondary.provider}/${cloud.secondary.region}` });
+  }
+  return items;
 }
 
 export function uptimePct(world: World): number {
   const bad = num(world.flags.uptimeBadMin);
   return Math.max(90, 100 - (bad / 43200) * 100);
+}
+
+// ------------------------------------------------------------------
+// Scale Era (P6b): capacity levers — CDN offload, async workers, read
+// replica, secondary region. Each buys its way out of one scale pressure.
+// ------------------------------------------------------------------
+
+/** CDN/edge cache: a hit-ratio share of requests never reach the origin (or its bill). */
+export function setCdn(world: World, tier: 'basic' | 'pro' | 'off'): { ok: boolean; message: string } {
+  if (!world.era) return { ok: false, message: 'the CDN opens with the Scale Era' };
+  if (tier === 'off') {
+    if (!world.cdn) return { ok: false, message: 'no CDN enabled' };
+    world.cdn = undefined;
+    audit(world, world.session.user, 'cloud', 'CDN disabled — every request hits the origin again');
+    return { ok: true, message: 'CDN disabled' };
+  }
+  world.cdn = { tier, enabledAtMin: world.nowMin };
+  const hit = ERA_ECON.cdnHitPct[tier];
+  audit(world, world.session.user, 'cloud', `CDN enabled (${tier}) — ~${hit}% of requests will be served from the edge and never touch your origin bill or your fleet`);
+  return { ok: true, message: `CDN ${tier} live — ~${hit}% hit ratio expected` };
+}
+
+/** A cache revalidation storm: hit ratio collapses, the origin feels the full wave. */
+export function startStampede(world: World): void {
+  const cdn = world.cdn;
+  if (!cdn) return;
+  cdn.stampedeUntilMin = world.nowMin + ERA_ECON.stampedeMin;
+  audit(world, 'system', 'era', 'CACHE STAMPEDE: expired keys are revalidating all at once — hit ratio just collapsed and the origin is taking the full wave');
+}
+
+/** Async workers drain the write path; undersized pools build backlog instead of DB load. */
+export function setQueueWorkers(world: World, count: number): { ok: boolean; message: string } {
+  if (!world.era) return { ok: false, message: 'async workers open with the Scale Era' };
+  const n = Math.max(0, Math.min(2000, Math.round(count)));
+  if (n === 0) {
+    if (!world.queue) return { ok: false, message: 'no async workers to release' };
+    world.queue = undefined;
+    audit(world, world.session.user, 'cloud', 'Async workers released — writes go straight into the database again');
+    return { ok: true, message: 'queue disbanded' };
+  }
+  const before = world.queue?.workers ?? 0;
+  if (!world.queue) world.queue = { workers: n, backlog: 0 };
+  else world.queue.workers = n;
+  audit(world, world.session.user, 'cloud', `Async worker pool: ${before} → ${n} (each drains ${ERA_ECON.workerDrainPerS} jobs/s at $${ERA_ECON.workerPrice}/mo) — writes beyond the drain rate wait in the backlog instead of hammering the DB`);
+  return { ok: true, message: `queue pool at ${n} workers` };
+}
+
+/** Read replica: takes ~60% of reads off the primary; lags when read-heavy. */
+export function setReplica(world: World, plan: 'db.micro' | 'db.small' | 'db.medium' | null): { ok: boolean; message: string } {
+  if (!world.era) return { ok: false, message: 'read replicas open with the Scale Era' };
+  if (!world.db.provisioned) return { ok: false, message: 'provision the managed database first' };
+  if (plan === null) {
+    if (!world.db.replica) return { ok: false, message: 'no replica to remove' };
+    world.db.replica = undefined;
+    audit(world, world.session.user, 'db', 'Read replica removed — the primary takes every read again');
+    return { ok: true, message: 'replica removed' };
+  }
+  world.db.replica = { plan, addedAtMin: world.nowMin };
+  audit(world, world.session.user, 'db', `Read replica enabled (${plan}) — ~${Math.round(ERA_ECON.replicaReadShare * 100)}% of reads move off the primary; watch replication lag before trusting it`);
+  return { ok: true, message: `read replica live (${plan})` };
+}
+
+/** Secondary region: ×1.5 duplication buys real failover from a regional outage. */
+export function setSecondaryRegion(world: World, providerId: string | null, regionId: string): { ok: boolean; message: string } {
+  if (!world.era) return { ok: false, message: 'multi-region opens with the Scale Era' };
+  const cloud = ensureCloud(world);
+  if (providerId === null) {
+    if (!cloud.secondary) return { ok: false, message: 'no secondary region to remove' };
+    const gone = cloud.secondary;
+    cloud.secondary = undefined;
+    audit(world, world.session.user, 'cloud', `Secondary region ${gone.region} decommissioned — single-region again, and the next provider outage is a full outage`);
+    return { ok: true, message: 'secondary region removed' };
+  }
+  if (!isRegion(providerId, regionId)) return { ok: false, message: `unknown region ${providerId}/${regionId}` };
+  if (providerId === cloud.provider && regionId === cloud.region) return { ok: false, message: 'the secondary must be a different region than the primary' };
+  cloud.secondary = { provider: providerId, region: regionId, sinceMin: world.nowMin };
+  audit(world, world.session.user, 'cloud', `Secondary region stood up: ${providerOf(providerId).name} ${regionId} — the footprint now bills ×1.5 (the standby is half-size), and a regional outage fails over in ~${ERA_ECON.failoverGlitchMin} min instead of ending the world`);
+  return { ok: true, message: `secondary region ${regionId} on standby` };
 }
 
 // ------------------------------------------------------------------
@@ -1377,7 +2169,8 @@ export function runCloudComparison(world: World): { ok: boolean; message: string
 /** A provider-side region outage: unfixable, timed, and billable. */
 export function openProviderOutage(world: World): void {
   const cloud = world.cloud;
-  if (!cloud || cloud.outage) return;
+  // an ACTIVE outage blocks a new one; a settled one (unclaimed-credit window) is superseded
+  if (!cloud || (cloud.outage && cloud.outage.endedAtMin === undefined)) return;
   const provider = providerOf(cloud.provider);
   const region = regionOf(cloud.provider, cloud.region);
   const durationMin = 15 + Math.floor(Math.random() * 31);
@@ -1404,6 +2197,12 @@ export function openProviderOutage(world: World): void {
   cloud.outage = { provider: cloud.provider, region: cloud.region, startedAtMin: world.nowMin, durationMin, creditClaimed: false, incidentId: inc.id };
   cloud.outagesSeen += 1;
   audit(world, 'system', 'incident', `PROVIDER OUTAGE: ${provider.name} ${region.id} is down (${provider.reliabilityPct}% SLA) — ~${durationMin} min, nothing you can fix`);
+  const secondary = cloud.secondary;
+  if (world.era && secondary && (secondary.provider !== cloud.provider || secondary.region !== cloud.region)) {
+    audit(world, 'system', 'era', `FAILOVER: ${region.id} is down — traffic cuts over to the ${secondary.region} standby (DNS window ~${ERA_ECON.failoverGlitchMin} min, half-fleet capacity until the region recovers). This is what the duplicate bill buys.`);
+  } else {
+    audit(world, 'system', 'era', 'No secondary region — the whole footprint rides this out (multi-region is a CLOUD tab lever).');
+  }
   pageOnCall(world, inc);
 }
 
@@ -1417,6 +2216,10 @@ export function tickCloud(world: World): void {
       o.endedAtMin = world.nowMin;
       const inc = world.monitoring.incidents.find((i) => i.id === o.incidentId);
       if (inc && inc.status === 'open') resolveIncident(world, inc, `${providerOf(o.provider).name} restored service after ${o.durationMin} min — claim your SLA credit (CLOUD tab)`);
+      // era (P6e): survived a provider outage with (near-)zero downtime — badge
+      if (world.era && world.cloud?.secondary && (latest(world, 'error_pct') ?? 99) < 2) {
+        grantEraBadge(world, 'outage-zero', 'provider outage survived with zero downtime — the standby held');
+      }
     }
     // unclaimed credits expire after a sim day
     if (o.endedAtMin !== undefined && !o.creditClaimed && world.nowMin - o.endedAtMin > 1440) {
@@ -1449,10 +2252,13 @@ export function tickCloud(world: World): void {
     }
     return;
   }
-  // ambient provider outage roll (throttled for the first 10h on a new footprint)
-  if (world.nowMin - cloud.sinceMin > 600) {
+  // ambient provider outage roll (throttled for the first 10h on a new footprint) —
+  // era (P6c): at S3+ on one region, scale is the adversary: providers fail you twice as often.
+  // Same controlled environment rule: no ambient outages during a live tournament.
+  if (!(world.tournament && !world.tournament.finished) && world.nowMin - cloud.sinceMin > 600) {
     const p = providerOf(cloud.provider);
-    if (Math.random() < p.outageChancePerDay / 1440) openProviderOutage(world);
+    const concentration = world.era && eraStageOf(world) >= 3 && !cloud.secondary ? ERA_ECON.concentrationMult : 1;
+    if (Math.random() < (p.outageChancePerDay * concentration) / 1440) openProviderOutage(world);
   }
 }
 
@@ -1563,9 +2369,11 @@ export function startProduct(world: World, productId: string): { ok: boolean; me
 
 /** Monthly recurring revenue from launched products, at current user count. */
 export function productMrrOf(world: World): number {
+  // era (P6c): revenue gates on posture — enterprise customers discount while findings are open
+  const posturePenalty = world.era && complianceFindings(world).length > 0 ? ERA_ECON.enterprisePosturePenalty : 1;
   return (world.products?.products ?? [])
     .filter((p) => p.launchedAtMin !== undefined)
-    .reduce((a, p) => a + world.company.users * (p.adoptionPct / 100) * p.pricePerUserMonthly, 0);
+    .reduce((a, p) => a + world.company.users * (p.adoptionPct / 100) * p.pricePerUserMonthly * (p.tier === 'enterprise' ? posturePenalty : 1), 0);
 }
 
 /** The core subscription: $2 per user per month. */
@@ -1579,8 +2387,20 @@ function tickProducts(world: World): void {
     if (p.startedAtMin !== undefined && p.launchedAtMin === undefined && world.nowMin - p.startedAtMin >= p.buildDurationMin) {
       p.launchedAtMin = world.nowMin;
       world.company.satisfaction = Math.min(5, world.company.satisfaction + 0.15);
+      if (world.era) p.lifecycle = { peakAdoptionPct: p.adoptionPct * 1.6, matureAtMin: world.nowMin + ERA_ECON.matureDays * 1440, generation: 1 };
       const mrr = world.company.users * (p.adoptionPct / 100) * p.pricePerUserMonthly;
       audit(world, 'system', 'product', `PRODUCT LAUNCHED: ${p.name} (${p.tier} tier) — ~$${Math.round(mrr).toLocaleString()}/mo from ${p.adoptionPct}% of users, +$${p.infraMonthly}/mo infra`);
+    }
+    // era (P6d): products live — ramp toward peak, mature, then decay until refreshed
+    if (world.era && p.launchedAtMin !== undefined) {
+      if (!p.lifecycle) p.lifecycle = { peakAdoptionPct: p.adoptionPct * 1.6, matureAtMin: world.nowMin + ERA_ECON.matureDays * 1440, generation: 1 };
+      const lc = p.lifecycle;
+      if (world.nowMin < lc.matureAtMin) {
+        const gap = lc.peakAdoptionPct - p.adoptionPct;
+        if (gap > 0.01) p.adoptionPct = Math.min(lc.peakAdoptionPct, p.adoptionPct + gap * ERA_ECON.lifecycleRampPerDay / 1440);
+      } else if (p.adoptionPct > 0.5) {
+        p.adoptionPct = Math.max(0.5, p.adoptionPct * (1 - ERA_ECON.lifecycleDecayPerDay / 1440));
+      }
     }
   }
 }
@@ -1660,7 +2480,8 @@ export function finopsRecommendations(world: World): FinOpsRec[] {
     });
   }
   // kubernetes: three nodes for a two-replica workload
-  if (world.k8s?.provisioned && world.k8s.nodes.length >= 3 && Object.values(world.k8s.deployments).every((d) => d.replicas <= 2)) {
+  // (suppressed in the era from S2 — nodes are capacity, not overhead)
+  if (world.k8s?.provisioned && !(world.era && eraStageOf(world) >= 2) && world.k8s.nodes.length >= 3 && Object.values(world.k8s.deployments).every((d) => d.replicas <= 2)) {
     recs.push({
       id: 'k8s-pool',
       label: 'Scale the node pool 3 → 2',
@@ -1742,7 +2563,7 @@ export function openIncidentOfKind(world: World, kind: string): void {
       openBadDeployIncident(world, world.app.image ?? 'registry/api:v1.9.0');
       break;
     case 'traffic_spike':
-      openAmbientIncident(world);
+      openAmbientIncident(world, true); // staged surge: a scored round must open
       break;
     case 'data_loss': {
       const orders = world.db.tables['orders'];
@@ -2056,6 +2877,10 @@ export function complianceFindings(world: World): ComplianceFinding[] {
   if (unfiled.length) {
     out.push({ id: 'postmortems-missing', label: `${unfiled.length} resolved incident(s) without postmortems`, severity: 'low', detail: 'every resolved incident needs a filed postmortem (INCIDENTS tab)' });
   }
+  // era (P6c): compliance at scale — concentration becomes a posture finding at S3+
+  if (world.era && eraStageOf(world) >= 3 && !world.cloud?.secondary) {
+    out.push({ id: 'single-region', label: 'Single-region footprint at scale', severity: 'high', detail: 'at this size one regional outage is a full outage plus a refund ledger event — stand up a secondary region (CLOUD tab)' });
+  }
   return out;
 }
 
@@ -2315,6 +3140,9 @@ export function acceptTermSheet(world: World): { ok: boolean; message: string } 
   // the announcement is the scale event: everyone tries the product at once
   world.company.users = Math.round(world.company.users * 2.2);
   world.scheduledEvents.push({ atMin: world.nowMin + 45, kind: 'exit_scale_check' });
+  // P6a: the sale closes and the Scale Era begins — infra bills by usage from here on
+  if (!world.era) world.era = { startedAtMin: world.nowMin, stageReached: 0 };
   audit(world, 'board', 'game', `TERM SHEET ACCEPTED: the company sells for $${payout.toLocaleString()}. The acquirers announce it in ~45 sim minutes — the traffic that follows is the final exam.`);
+  audit(world, 'board', 'game', 'SCALE ERA BEGINS: infrastructure now bills by usage — every request, gigabyte and db-CPU point above the included plan has a price. Watch the burn on the COSTS tab.');
   return { ok: true, message: `deal closed: +$${payout.toLocaleString()} — survive the announcement traffic` };
 }

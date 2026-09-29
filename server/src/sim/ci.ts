@@ -2,6 +2,7 @@
 // run stages with realistic logs, build/push images through the docker sim,
 // create deployments, support rollback.
 import { World, Pipeline, PipelineStep, CiRun, Deployment, OutLine } from '../types';
+import { coordinationTaxRoll } from '../world';
 import { parseYaml } from './yaml';
 import { buildImage, pushToRegistry } from './docker';
 import { readFile } from './fs';
@@ -298,6 +299,7 @@ function processSteps(world: World, run: CiRun, steps: PipelineStep[], ctx: Step
         log.push(`Deploying ${image} …`);
         log.push(`Container ${d ? 'replaced' : 'created'} for service api`);
         log.push('Health check passed after 3.2s');
+        coordinationTaxRoll(world); // era (P6c): big teams without a portal ship regressions
         if (world.flags.nextDeployHasBug && !world.flags.badDeployBug) {
           world.flags.badDeployBug = true;
           world.flags.nextDeployHasBug = false;

@@ -36,11 +36,12 @@ export function provisionCluster(world: World): { ok: boolean; message: string }
   return { ok: true, message: 'cluster k8s-01 provisioned — kubectl is configured on web-01' };
 }
 
-/** Resize the managed node pool (2–4 nodes); pods on removed nodes get rescheduled. */
+/** Resize the managed node pool (2–4 nodes; the Scale Era lifts the cap — scale needs fleet). Pods on removed nodes get rescheduled. */
 export function resizeNodePool(world: World, count: number): { ok: boolean; message: string } {
   const k = world.k8s;
   if (!k?.provisioned) return { ok: false, message: 'no cluster provisioned' };
-  const n = Math.max(2, Math.min(4, Math.round(count)));
+  const max = world.era ? 500 : 4;
+  const n = Math.max(2, Math.min(max, Math.round(count)));
   if (n === k.nodes.length) return { ok: false, message: `pool already has ${n} nodes` };
   const before = k.nodes.length;
   if (n < k.nodes.length) {
@@ -52,7 +53,7 @@ export function resizeNodePool(world: World, count: number): { ok: boolean; mess
     }
     world.audit.push({ t: world.nowMin, actor: world.session.user, kind: 'cloud', text: `Node pool resized ${before} → ${n} nodes (${removed.join(', ')} drained)` });
   } else {
-    while (k.nodes.length < n) k.nodes.push(`k8s-01-node-${String.fromCharCode(97 + k.nodes.length)}`);
+    while (k.nodes.length < n) k.nodes.push(`k8s-01-node-${Math.floor(k.nodes.length / 26) + 1}${String.fromCharCode(97 + (k.nodes.length % 26))}`);
     world.audit.push({ t: world.nowMin, actor: world.session.user, kind: 'cloud', text: `Node pool grown ${before} → ${n} nodes` });
   }
   return { ok: true, message: `node pool now has ${n} nodes` };

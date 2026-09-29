@@ -563,6 +563,8 @@ export function DbView({ game, view, refresh }: { game: string; view: GameView; 
   const [sql, setSql] = useState("EXPLAIN ANALYZE SELECT * FROM orders WHERE status = 'paid';");
   const [result, setResult] = useState<SqlResult | null>(null);
   const [migLines, setMigLines] = useState<OutLine[]>([]);
+  const [replicaMsg, setReplicaMsg] = useState('');
+  const say = (m: string) => { setReplicaMsg(m); refresh(); };
 
   const query = async () => {
     const r = await api.dbQuery(game, sql);
@@ -600,6 +602,24 @@ export function DbView({ game, view, refresh }: { game: string; view: GameView; 
           </div>
         )}
         {view.db.pooler && <div style={{ marginTop: 8 }}><span className="pill ok">pgbouncer active</span></div>}
+        {view.era && view.db.provisioned && (
+          <div style={{ marginTop: 10 }}>
+            {replicaMsg && <div className="dimtxt" style={{ marginBottom: 6 }}>{replicaMsg}</div>}
+            {view.db.replica ? (
+              <div className="row" style={{ gap: 10, flexWrap: 'wrap' }}>
+                <span className="pill ok">read replica: {view.db.replica.plan}</span>
+                <span className={`pill ${view.db.replica.lagMs > 250 ? 'err' : view.db.replica.lagMs > 100 ? 'warn' : 'ok'}`}>replication lag {view.db.replica.lagMs}ms{view.db.replica.lagMs > 250 ? ' — users are reading stale data' : ''}</span>
+                <button onClick={async () => { const r = await api.replicaSet(game, 'off'); say(r.message); }}>REMOVE REPLICA</button>
+                {view.db.replica.plan !== 'db.medium' && <button onClick={async () => { const r = await api.replicaSet(game, 'db.medium'); say(r.message); }}>RESIZE → db.medium</button>}
+              </div>
+            ) : (
+              <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                <button onClick={async () => { const r = await api.replicaSet(game, 'db.small'); say(r.message); }}>ADD READ REPLICA (db.small, $120/mo)</button>
+                <span className="dimtxt">takes ~60% of reads off the primary — but it lags under load, and stale reads are real</span>
+              </div>
+            )}
+          </div>
+        )}
         {migLines.length > 0 && <div className="logview" style={{ marginTop: 10 }}>{migLines.map((l, i) => <div key={i} className={l.cls}>{l.text}</div>)}</div>}
         {view.db.tables.length > 0 && (
           <table className="list" style={{ marginTop: 12 }}>
@@ -757,6 +777,8 @@ export function Monitoring({ game, view, refresh }: { game: string; view: GameVi
         <Chart title="DB CPU %" points={s.db_cpu_pct ?? []} color="#bc8cff" unit="%" />
         <Chart title="Disk %" points={s.disk_pct ?? []} color="#f0883e" unit="%" />
         <Chart title="Requests/s" points={s.req_rate ?? []} color="#3fb970" />
+        {view.era && view.db.replica && <Chart title="Replica lag ms" points={s.replica_lag_ms ?? []} color="#f778ba" unit="ms" />}
+        {view.era?.queue && <Chart title="Queue backlog" points={s.queue_backlog ?? []} color="#d29922" />}
       </div>
 
       <div className="panel">
@@ -771,6 +793,8 @@ export function Monitoring({ game, view, refresh }: { game: string; view: GameVi
               <option value="db_cpu_pct">db_cpu_pct</option>
               <option value="p95_ms">p95_ms</option>
               <option value="db_p95_ms">db_p95_ms</option>
+              {view.db.replica && <option value="replica_lag_ms">replica_lag_ms</option>}
+              {view.era?.queue && <option value="queue_backlog">queue_backlog</option>}
             </select>
             <span>&gt;</span>
             <input value={threshold} onChange={(e) => setThreshold(e.target.value)} style={{ width: 80 }} />
@@ -868,13 +892,71 @@ export function Cloud({ game, view, refresh }: { game: string; view: GameView; r
   const [dnsValue, setDnsValue] = useState('203.0.113.10');
   const [fwPort, setFwPort] = useState('80');
   const [msg, setMsg] = useState('');
+  const [workers, setWorkers] = useState('');
+  const [secRegion, setSecRegion] = useState('');
 
   const say = (m: string) => { setMsg(m); refresh(); };
   const c = view.cloud;
+  const era = view.era;
+  const regionOptions = (c?.comparison ?? []).filter((r) => r.provider !== c?.provider || r.region !== c?.region);
 
   return (
     <div>
       {msg && <div className="panel" style={{ borderColor: 'var(--green)' }}><span style={{ color: 'var(--green)' }}>✓ {msg}</span></div>}
+
+      {era && (
+        <div className="panel">
+          <h2>Scale Era capacity levers <span className="hintInline">each one buys its way out of one scale pressure</span></h2>
+          <div className="row" style={{ gap: 10, flexWrap: 'wrap' }}>
+            {era.cdn ? (
+              <>
+                <span className={`pill ${era.cdn.stampede ? 'err' : 'ok'}`}>CDN {era.cdn.tier} · {era.burn.cdnHitPct}% hit ratio{era.cdn.stampede ? ' — STAMPEDE: cache revalidating, origin taking the full wave' : ''}</span>
+                <button onClick={async () => { const r = await api.cdnSet(game, 'off'); say(r.message); }}>TURN OFF</button>
+              </>
+            ) : (
+              <>
+                <button onClick={async () => { const r = await api.cdnSet(game, 'basic'); say(r.message); }}>CDN BASIC ($150/mo, ~60% hits)</button>
+                <button className="primary" onClick={async () => { const r = await api.cdnSet(game, 'pro'); say(r.message); }}>CDN PRO ($400/mo, ~85% hits)</button>
+                <span className="dimtxt">edge hits never touch your origin bill, your egress, or your fleet</span>
+              </>
+            )}
+          </div>
+          <div className="row" style={{ gap: 10, marginTop: 10, flexWrap: 'wrap' }}>
+            {era.queue ? (
+              <>
+                <span className={`pill ${era.burn.queueBacklog > 20000 ? 'err' : era.burn.queueBacklog > 2000 ? 'warn' : 'ok'}`}>queue: {era.queue.workers} workers · backlog {era.burn.queueBacklog.toLocaleString()}</span>
+                <input value={workers} onChange={(e) => setWorkers(e.target.value)} style={{ width: 90 }} placeholder="workers" />
+                <button onClick={async () => { const r = await api.queueSet(game, Number(workers)); say(r.message); setWorkers(''); }}>RESIZE</button>
+                <button onClick={async () => { const r = await api.queueSet(game, 0); say(r.message); }}>DISBAND</button>
+              </>
+            ) : (
+              <>
+                <input value={workers} onChange={(e) => setWorkers(e.target.value)} style={{ width: 90 }} placeholder="workers" />
+                <button className="primary" onClick={async () => { const r = await api.queueSet(game, Number(workers)); say(r.message); setWorkers(''); }}>HIRE ASYNC WORKERS ($35/mo each)</button>
+                <span className="dimtxt">each drains 40 jobs/s — writes beyond that wait in the backlog instead of hammering the DB</span>
+              </>
+            )}
+          </div>
+          <div className="row" style={{ gap: 10, marginTop: 10, flexWrap: 'wrap' }}>
+            {era.secondary ? (
+              <>
+                <span className="pill ok">secondary region: {era.secondary.region} on standby{era.burn.failoverReady ? ' — failover ready' : ''}</span>
+                <button onClick={async () => { const r = await api.secondaryRemove(game); say(r.message); }}>DECOMMISSION</button>
+              </>
+            ) : regionOptions.length > 0 ? (
+              <>
+                <select value={secRegion} onChange={(e) => setSecRegion(e.target.value)}>
+                  <option value="">standby region…</option>
+                  {regionOptions.map((r, i) => <option key={i} value={`${r.provider}/${r.region}`}>{r.provider}/{r.region}</option>)}
+                </select>
+                <button className="primary" disabled={!secRegion} onClick={async () => { const [p, rg] = secRegion.split('/'); const r = await api.secondarySet(game, p, rg); say(r.message); }}>STAND UP SECONDARY REGION (footprint ×1.5)</button>
+              </>
+            ) : (
+              <span className="dimtxt">run a provider comparison first — then pick a standby region</span>
+            )}
+          </div>
+        </div>
+      )}
 
       {c ? (
         <div className="panel">
@@ -1186,6 +1268,41 @@ export function Cloud({ game, view, refresh }: { game: string; view: GameView; r
 // =====================================================================
 // COSTS + FINOPS
 // =====================================================================
+function EraBurnPanel({ burn }: { burn: NonNullable<GameView['era']>['burn'] }) {
+  const utilPeak = burn.utilPeakPct;
+  const utilClass = utilPeak > 100 ? 'err' : utilPeak >= 70 ? 'warn' : 'ok';
+  const marginClass = burn.marginPct >= 60 ? 'ok' : burn.marginPct >= 40 ? 'warn' : 'err';
+  const fmtB = (n: number) => (n >= 1e9 ? `${(n / 1e9).toFixed(1)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(0)}M` : n.toLocaleString());
+  const STAGE_NAMES = ['pre-scale', 'S1 reads', 'S2 origin', 'S3 writes', 'S4 partitions', 'S5 everything'];
+  return (
+    <div className="panel" style={{ borderColor: 'var(--accent, #3b82f6)' }}>
+      <h2>Scale Era burn <span className="hintInline">money is telemetry now — every request has a meter</span></h2>
+      <div className="row" style={{ gap: 12, flexWrap: 'wrap' }}>
+        <span className="pill warn">burning ${burn.hourlyBurn.toLocaleString()}/sim-hour (infra + payroll)</span>
+        <span className="pill">projected month-end infra: ${burn.projectedMonthEnd.toLocaleString()}</span>
+        <span className="pill ok">${burn.costPerUser}/user cost · ${burn.revenuePerUser}/user revenue</span>
+        <span className={`pill ${marginClass}`}>margin {burn.marginPct}%</span>
+        <span className="pill">stage {burn.stage} · {STAGE_NAMES[burn.stage] ?? ''}</span>
+      </div>
+      <div className="row" style={{ marginTop: 10, gap: 12, flexWrap: 'wrap' }}>
+        <span className="dimtxt">{fmtB(burn.reqsMonthly)} req/mo · {fmtB(burn.billedReqsMonthly)} billed{burn.cdnHitPct > 0 ? ` (CDN offloading ${burn.cdnHitPct}%)` : ' (first 2B included)'}</span>
+        <span className="dimtxt">{burn.egressGB.toLocaleString()} GB egress/mo</span>
+        <span className="dimtxt">{burn.logGB.toLocaleString()} GB logs/mo</span>
+        <span className={`pill ${utilClass}`}>
+          fleet: {burn.capacity / 200} unit(s) · util {burn.utilAvgPct}% avg / {utilPeak}% peak
+          {utilPeak > 100 ? ' — overload is throwing 5xx, add capacity or offload' : utilPeak >= 70 ? ' — latency bends above 70%' : ''}
+        </span>
+        {burn.replicaLagMs > 0 && <span className={`pill ${burn.replicaLagMs > 250 ? 'err' : 'warn'}`}>replica lag {burn.replicaLagMs}ms</span>}
+        {burn.queueBacklog > 0 && <span className={`pill ${burn.queueBacklog > 20000 ? 'err' : 'warn'}`}>backlog {burn.queueBacklog.toLocaleString()}</span>}
+        {!burn.failoverReady && <span className="pill warn">single-region</span>}
+      </div>
+      <div className="dimtxt" style={{ marginTop: 8 }}>
+        each resource bills monthly cost ÷ 720 per sim-hour; the projection assumes current user growth holds to month end.
+      </div>
+    </div>
+  );
+}
+
 export function Costs({ game, view, refresh }: { game: string; view: GameView; refresh: Refresh }) {
   const [budget, setBudget] = useState('');
   const [msg, setMsg] = useState('');
@@ -1205,12 +1322,14 @@ export function Costs({ game, view, refresh }: { game: string; view: GameView; r
   return (
     <div>
       {msg && <div className="panel" style={{ borderColor: 'var(--green)' }}><span style={{ color: 'var(--green)' }}>✓ {msg}</span></div>}
+      {view.era && <EraBurnPanel burn={view.era.burn} />}
       <div className="panel">
         <h2>Monthly infrastructure cost</h2>
         <table className="list">
           <thead>
             <tr>
               <th>category</th><th>item</th>{hasProviderCol && <th>provider</th>}<th style={{ textAlign: 'right' }}>$ / month</th>
+              {view.era && <th style={{ textAlign: 'right' }}>$ / sim-hour</th>}
             </tr>
           </thead>
           <tbody>
@@ -1219,9 +1338,10 @@ export function Costs({ game, view, refresh }: { game: string; view: GameView; r
                 <td>{li.category}</td><td>{li.label}</td>
                 {hasProviderCol && <td className="dimtxt">{li.provider ?? '—'}</td>}
                 <td style={{ textAlign: 'right' }}>${li.monthlyCost.toLocaleString()}</td>
+                {view.era && <td style={{ textAlign: 'right' }} className="dimtxt">${(li.monthlyCost / 720).toFixed(2)}</td>}
               </tr>
             ))}
-            <tr><td /><td><b>TOTAL</b></td>{hasProviderCol && <td />}<td style={{ textAlign: 'right' }}><b>${total.toLocaleString()}</b></td></tr>
+            <tr><td /><td><b>TOTAL</b></td>{hasProviderCol && <td />}<td style={{ textAlign: 'right' }}><b>${total.toLocaleString()}</b></td>{view.era && <td style={{ textAlign: 'right' }}><b>${(total / 720).toFixed(2)}</b></td>}</tr>
           </tbody>
         </table>
         <div className="dimtxt" style={{ marginTop: 8 }}>
@@ -1354,7 +1474,9 @@ export function Postmortems({ game, view, refresh }: { game: string; view: GameV
 // =====================================================================
 // KUBERNETES
 // =====================================================================
-export function K8sView({ view }: { view: GameView }) {
+export function K8sView({ game, view, refresh }: { game: string; view: GameView; refresh: Refresh }) {
+  const [poolCount, setPoolCount] = useState('');
+  const [poolMsg, setPoolMsg] = useState('');
   if (!view.k8s) {
     return (
       <div className="panel">
@@ -1370,11 +1492,17 @@ export function K8sView({ view }: { view: GameView }) {
   return (
     <div>
       <div className="panel">
-        <h2>{k.name} <span className="hintInline">{k.version} · 3 nodes · api endpoint {k.ip}</span></h2>
+        <h2>{k.name} <span className="hintInline">{k.version} · {k.nodes} node{k.nodes === 1 ? '' : 's'} · api endpoint {k.ip}</span></h2>
         <div className="row" style={{ gap: 14 }}>
           <span className={`pill ${k.serving ? 'ok' : 'warn'}`}>{k.serving ? 'serving the API' : 'not serving'}</span>
           <span className={`pill ${k.zeroDowntimeProven ? 'ok' : 'warn'}`}>{k.zeroDowntimeProven ? 'zero-downtime rollout ✓' : 'no rollout proven yet'}</span>
           <span className="dimtxt">drive it from the TERMINAL: kubectl apply / get / describe / set image / autoscale / rollout</span>
+        </div>
+        <div className="row" style={{ marginTop: 10, gap: 10 }}>
+          <input value={poolCount} onChange={(e) => setPoolCount(e.target.value)} style={{ width: 90 }} placeholder="node count" />
+          <button className="primary" onClick={async () => { const r = await api.k8sNodes(game, Number(poolCount)); setPoolMsg(r.message); refresh(); }}>RESIZE POOL</button>
+          {poolMsg && <span className="dimtxt">{poolMsg}</span>}
+          <span className="dimtxt">each node serves ~200 req/s · pool runs 2–{view.era ? '500 (Scale Era — fleet is how you buy headroom)' : '4'}</span>
         </div>
       </div>
 
@@ -1461,7 +1589,7 @@ export function Company({ game, view, refresh }: { game: string; view: GameView;
           <h2>Team <span className="hintInline">salaries hit the monthly payroll — every role changes how the world behaves</span></h2>
           {view.team.engineers.length === 0 ? <div className="dimtxt">You are a team of one. The pager goes to the founder.</div> : null}
           <table className="list">
-            <thead><tr><th>name</th><th>role</th><th>salary</th><th>on call</th><th></th></tr></thead>
+            <thead><tr><th>name</th><th>role</th><th>salary</th><th>on call</th>{view.era && <th>burnout</th>}<th></th></tr></thead>
             <tbody>
               {view.team.engineers.map((e) => (
                 <tr key={e.id}>
@@ -1473,6 +1601,12 @@ export function Company({ game, view, refresh }: { game: string; view: GameView;
                       ? <span className="pill ok">📱 on call</span>
                       : <button onClick={async () => { const r = await api.setOnCall(game, e.id); say(r.message); }}>give pager</button>}
                   </td>
+                  {view.era && (
+                    <td>
+                      {e.burnout === 0 ? <span className="dimtxt">—</span>
+                        : <span className={`pill ${e.burnout >= 80 ? 'err' : e.burnout >= 40 ? 'warn' : 'ok'}`}>🔥 {e.burnout}%{e.burnout >= 80 ? ' — about to quit' : ''}</span>}
+                    </td>
+                  )}
                   <td><button onClick={async () => { const r = await api.fire(game, e.id); say(r.message); }}>let go</button></td>
                 </tr>
               ))}
@@ -1492,6 +1626,26 @@ export function Company({ game, view, refresh }: { game: string; view: GameView;
         </div>
 
         <div>
+          {view.era && (
+            <div className="panel" style={{ marginBottom: 14 }}>
+              <h2>On-call load <span className="hintInline">pages scale with the fleet — automation buys engineer-minutes back</span></h2>
+              <div className="row" style={{ gap: 12, flexWrap: 'wrap' }}>
+                <span className={`pill ${view.era.oncall.overloaded ? 'err' : 'ok'}`}>
+                  {view.era.oncall.demandMin} of {view.era.oncall.supplyMin} eng-min/day ({view.era.oncall.ratioPct}%){view.era.oncall.overloaded ? ' — OVERLOADED, burnout accruing' : ' — the team can carry the pager'}
+                </span>
+                <span className="dimtxt">{view.era.oncall.fleetUnits} fleet unit(s) · {view.era.oncall.openIncidents} open incident(s)</span>
+                <span className={`pill ${view.era.oncall.discountPct < 80 ? 'ok' : 'warn'}`}>automation: −{100 - view.era.oncall.discountPct}% page load</span>
+              </div>
+              <div className="dimtxt" style={{ marginTop: 8 }}>
+                demand = fleet × 15 + open incidents × 90 + debt × 8 engineer-minutes/day. The developer portal (−25%), each published golden path (−3%), and written SLOs (−10%) buy minutes back — that is the automation dividend. Past 100%, engineers burn out; at 100% burnout they quit.
+              </div>
+              {view.era.incidentCashPaid > 0 && (
+                <div className="row" style={{ marginTop: 8 }}>
+                  <span className="pill warn">incident ledger: ${view.era.incidentCashPaid.toLocaleString()} paid out in refunds & SLA credits</span>
+                </div>
+              )}
+            </div>
+          )}
           <div className="panel">
             <h2>Technical debt <span className="hintInline">debt raises the odds of the next incident</span></h2>
             <div className="row" style={{ gap: 14 }}>
@@ -1548,7 +1702,17 @@ export function Company({ game, view, refresh }: { game: string; view: GameView;
                     <span className="dimtxt">{p.tagline}</span>
                   </span>
                   {p.launchedAtMin !== null
-                    ? <span className="pill ok">live · ${p.mrr?.toLocaleString()}/mo</span>
+                    ? <span className="row" style={{ gap: 8 }}>
+                        <span className="pill ok">live · ${p.mrr?.toLocaleString()}/mo</span>
+                        {p.lifecycle && view.era && (
+                          <span className={`pill ${p.lifecycle.phase === 'decaying' ? 'err' : p.lifecycle.matureInDays <= 7 ? 'warn' : 'ok'}`}>
+                            v{p.lifecycle.generation} · {p.lifecycle.phase === 'ramping' ? `ramping, matures in ${p.lifecycle.matureInDays}d` : 'DECAYING — ship a refresh'}
+                          </span>
+                        )}
+                        {p.lifecycle && view.era && (
+                          <button onClick={async () => { const r = await api.productRefresh(game, p.id); say(r.message); }}>SHIP v{p.lifecycle.generation + 1} (${p.lifecycle.refreshCost.toLocaleString()})</button>
+                        )}
+                      </span>
                     : p.startedAtMin !== null
                       ? <span className="pill warn">building… {p.progress}%</span>
                       : (
@@ -1835,9 +1999,66 @@ function CompliancePanel({ game, view, say }: { game: string; view: GameView; sa
 function AcquisitionPanel({ game, view, say }: { game: string; view: GameView; say: (m: string) => void }) {
   const e = view.endgame;
   const allGreen = e.pillars.every((p) => p.pass);
+  const era = view.era;
+  const STAGE_NAMES = ['pre-scale', 'S1 reads', 'S2 origin', 'S3 writes', 'S4 partitions', 'S5 everything'];
   return (
     <div className="panel">
       <h2>Acquisition <span className="hintInline">due diligence over everything you built</span></h2>
+      {e.legendMode && era && (
+        <div style={{ borderTop: '1px solid #202938', paddingTop: 12, marginBottom: 14 }}>
+          <h2 style={{ marginTop: 0 }}>Scale Era <span className="hintInline">day {era.eraDay} · the board demands growth</span></h2>
+          <div className="row" style={{ gap: 12, flexWrap: 'wrap' }}>
+            <span className="pill ok">stage {era.burn.stage} · {STAGE_NAMES[era.burn.stage] ?? ''}</span>
+            <span className="pill">{Math.round(view.company.users).toLocaleString()} users{era.nextStageUsers ? ` → next stage at ${era.nextStageUsers.toLocaleString()}` : ' → the summit'}</span>
+            <span className="pill warn">growth ×{era.growthMult}</span>
+            <span className={`pill ${era.rdLevel > 0 ? 'ok' : 'warn'}`}>R&D level {era.rdLevel}{era.rdNextCost === null ? ' (maxed)' : ''}</span>
+          </div>
+          <div className="row" style={{ gap: 10, marginTop: 12, flexWrap: 'wrap' }}>
+            <button className="primary" onClick={async () => { const r = await api.eraCrank(game); say(r.message); }}>⏩ CRANK A DAY</button>
+            {era.rdNextCost !== null && (
+              <button onClick={async () => { const r = await api.eraRd(game); say(r.message); }}>INVEST R&D (${era.rdNextCost.toLocaleString()} → growth +8%)</button>
+            )}
+            <span className="dimtxt">cranking runs a full sim day instantly — incidents, stampedes and the pager all happen; handle what broke</span>
+          </div>
+
+          <h3 style={{ marginTop: 16 }}>The race <span className="hintInline">wealth AND robustness count — the Ship It Index is robustness-weighted worth</span></h3>
+          <table className="list">
+            <thead><tr><th>#</th><th>company</th><th>users</th><th>MRR</th><th>margin</th><th>robustness</th><th>valuation</th><th>Ship It Index</th></tr></thead>
+            <tbody>
+              {era.race.rows.map((row, i) => (
+                <tr key={row.id} style={row.you ? { background: 'rgba(63,185,80,0.08)' } : undefined}>
+                  <td><b>{i + 1}</b></td>
+                  <td><b>{row.name}</b> <span className="dimtxt">{row.archetype}</span></td>
+                  <td>{row.users.toLocaleString()}</td>
+                  <td>${row.mrr.toLocaleString()}/mo</td>
+                  <td className="dimtxt">{row.marginPct}%</td>
+                  <td><span className={`pill ${row.robustness >= 85 ? 'ok' : row.robustness >= 60 ? 'warn' : 'err'}`}>{row.robustness}</span></td>
+                  <td>${row.valuation.toLocaleString()}</td>
+                  <td><b>{row.index.toLocaleString()}</b></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="row" style={{ gap: 12, marginTop: 8, flexWrap: 'wrap' }}>
+            <span className={`pill ${era.race.playerRank === 1 ? 'ok' : 'warn'}`}>
+              {era.race.playerRank === 1 ? 'you lead the race' : `rank #${era.race.playerRank} — ${era.race.gapToNext?.toLocaleString()} index points behind ${era.race.rows[era.race.playerRank - 2].name}`}
+            </span>
+          </div>
+
+          <div className="row" style={{ gap: 10, marginTop: 12, flexWrap: 'wrap' }}>
+            <span className="dimtxt">milestones:</span>
+            {['mrr-1m', 'uptime-1m', 'outage-zero', 'margin-10m', 'summit'].map((id) => (
+              <span key={id} className={`pill ${era.badges.includes(id) ? 'ok' : ''}`} style={era.badges.includes(id) ? undefined : { opacity: 0.45 }}>
+                {era.badges.includes(id) ? '★' : '☆'} {id}
+              </span>
+            ))}
+          </div>
+          <div className="row" style={{ gap: 10, marginTop: 8 }}>
+            <span className="dimtxt">run code (share it, friends can decode it offline):</span>
+            <span style={{ fontFamily: 'monospace' }}>{era.shareCode}</span>
+          </div>
+        </div>
+      )}
       {e.legendMode ? (
         <div className="dimtxt">
           <b>ACQUIRED — legend mode.</b> The world keeps happening: sandbox, challenges and packs are yours.

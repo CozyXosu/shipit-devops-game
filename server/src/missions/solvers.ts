@@ -863,9 +863,28 @@ spec:
       }
       pillars = c.act('Re-run due diligence with the honest promises', () => dueDiligence(c.w));
     }
+    // the announcement doubles traffic, and the era's utilization mechanic makes
+    // an undersized fleet throw 5xx through the scale-event check — size the
+    // fleet for the wave BEFORE signing (works pre- and post-acceptance)
+    if (c.w.k8s?.provisioned) {
+      // ×1.6 spike headroom, no host-count credit (vm-02 may be decommissioned)
+      const want = Math.max(2, Math.min(500, Math.ceil((c.w.company.users * 2.2 * 0.02 * 1.6) / 200)));
+      if (want > c.w.k8s.nodes.length) c.act(`Scale the fleet for the announcement wave (${c.w.k8s.nodes.length} → ${want} nodes)`, () => resizeNodePool(c.w, want));
+    }
     if (c.need('term-sheet')) c.act('Accept the term sheet', () => acceptTermSheet(c.w));
-    if (c.need('scale-survived')) c.wait('The announcement wave hits — the platform holds', () => Boolean(c.w.flags.scaleEventSurvived), 240, 5);
+    if (c.need('scale-survived')) c.wait('The announcement wave hits — the platform holds', () => Boolean(c.w.flags.scaleEventSurvived), 900, 15);
     sweepPostmortems(c);
+    // the wave (and ambient chaos after it) can burn the error budget or leave
+    // an unfiled postmortem — the data room is live state, so close it honestly
+    const post = c.act('Re-run due diligence after the wave', () => dueDiligence(c.w));
+    if (post?.some((p) => !p.pass)) {
+      for (const target of [99.0, 98.5, 98.0, 97.0, 95.0]) {
+        c.act(`Re-commit to an honest SLO the platform keeps (${target}% availability)`, () => configureSlos(c.w, target, 1000));
+        if (sloReport(c.w).budgetRemainingPct > 0) break;
+      }
+      sweepPostmortems(c);
+      c.act('Re-run due diligence with the honest promises', () => dueDiligence(c.w));
+    }
   }
 };
 
@@ -902,12 +921,14 @@ function withRoundRetry(c: Ctx, pmId: string, eventKind: string, play: () => voi
 }
 
 function playSurgeRound(c: Ctx): void {
-  let inc = roundIncident(c, 'pmr-01', 'traffic_spike');
-  if (!inc) c.wait('The traffic surge opens (~10 sim min into the round)', () => Boolean(roundIncident(c, 'pmr-01', 'traffic_spike')), 90, 2);
-  inc = roundIncident(c, 'pmr-01', 'traffic_spike');
-  if (!inc) { c.note('The surge round did not open — the event may have been consumed'); return; }
-  if (inc.status !== 'resolved') c.wait('The surge subsides and the incident auto-resolves (MTTR clock running)', () => roundIncident(c, 'pmr-01', 'traffic_spike')?.status === 'resolved', 250, 5);
-  if (!inc.postmortemFiled) c.act('File the postmortem (≥2 corrective actions)', () => filePostmortem(c.w, inc!.id, ['autoscale', 'trafficalert']));
+  withRoundRetry(c, 'pmr-01', 'ambient_incident', () => {
+    let inc = roundIncident(c, 'pmr-01', 'traffic_spike');
+    if (!inc) c.wait('The traffic surge opens (~10 sim min into the round)', () => Boolean(roundIncident(c, 'pmr-01', 'traffic_spike')), 90, 2);
+    inc = roundIncident(c, 'pmr-01', 'traffic_spike');
+    if (!inc) { c.note('The surge round did not open — the event may have been consumed'); return; }
+    if (inc.status !== 'resolved') c.wait('The surge subsides and the incident auto-resolves (MTTR clock running)', () => roundIncident(c, 'pmr-01', 'traffic_spike')?.status === 'resolved', 250, 5);
+    if (!inc.postmortemFiled) c.act('File the postmortem (≥2 corrective actions)', () => filePostmortem(c.w, inc!.id, ['autoscale', 'trafficalert']));
+  });
 }
 
 const PACK_SOLVERS: Record<string, Solver> = {

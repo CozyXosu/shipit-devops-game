@@ -339,6 +339,7 @@ describe('P5: trust & scale — full chain m33 → m40', () => {
     expect(Boolean(W().endgame?.termSheetAccepted)).toBe(true);
     expect(W().company.users).toBeGreaterThan(usersBefore * 2); // announcement wave armed
     expect(W().scheduledEvents.some((e) => e.kind === 'exit_scale_check')).toBe(true);
+    expect(W().era).toBeDefined(); // P6a: accepting the term sheet starts the Scale Era economy
 
     tick(W(), 50); // the announcement traffic hits at +45
     expect(Boolean(W().flags.scaleEventSurvived)).toBe(true);
