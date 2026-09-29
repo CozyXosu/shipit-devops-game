@@ -20,8 +20,8 @@ trust it blindly. Last updated: 2026-09-29 (P6e race pass — P6 complete).
 ## Git
 
 - Branch `main`, pushed to github.com/CozyXosu/shipit-devops-game. Last
-  release: **v0.5.0 — the Scale Era** (P6 implementation commit + README/
-  version release commit on top of the fog pass `cbd0f4a`).
+  release: **v0.5.0 — the Scale Era**, commit `928a62c` (on top of the fog
+  pass `cbd0f4a`). Working tree clean.
 - History: `47c4668` (v0.3, P1–P4) → `05e8c02` (v0.4, P5) → `cbd0f4a`
   (fog of war) → v0.5.0 (P6a–P6e, the Scale Era).
 - `data/` is gitignored: live save games are NOT in git.
